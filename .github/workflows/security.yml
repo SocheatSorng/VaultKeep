@@ -1,0 +1,74 @@
+name: Security
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1" # weekly, Monday 03:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  workflows:
+    name: Workflow audit (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: zizmor
+        run: pipx run zizmor==1.33.1 --format plain .github/workflows
+
+  dependencies:
+    name: Dependency audit
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # VaultKeep uses only the .NET Framework that ships with Windows: no third-party packages.
+      # This step fails if a package dependency is ever added, so a real audit gets set up then.
+      - name: Ensure no unaudited third-party packages
+        shell: powershell
+        run: |
+          $found = Get-ChildItem -Recurse -File -Include packages.config, *.csproj, packages.lock.json, package.json, pyproject.toml
+          if ($found) { $found.FullName; throw 'Package manifest found: add a dependency audit (dotnet list package --vulnerable / npm audit / pip-audit).' }
+          'No third-party dependencies.'

@@ -1,0 +1,32 @@
+# Build output
+bin/
+obj/
+*.exe
+*.pdb
+
+# Test scratch output
+tests/out/
+*.vkl
+*.vkpart
+
+# Secrets: never commit these
+.env
+.env.*
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
+credentials*.json
+secrets*.json
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
