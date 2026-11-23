@@ -3,7 +3,7 @@
 . (Join-Path $PSScriptRoot 'TestLib.ps1')
 $t = New-TestDir 'session'
 $pw = New-PasswordFile $t 'correct-horse-9'
-$recDir = Join-Path $env:LOCALAPPDATA 'VaultKeep\open'
+$recDir = Join-Path $env:VAULTKEEP_HOME 'open'
 Add-Type -AssemblyName System.Security
 # Records are DPAPI-encrypted; decrypt them the same way VaultKeep does to find ours.
 function Get-Record([string]$path) {
@@ -21,6 +21,8 @@ $file = Join-Path $t 'diary.txt'; Set-Content $file 'day 1'
 Check ((Invoke-VaultKeep lock $file $pw).Code -eq 0) 'lock file'
 $p = Start-OpenSession "$file.vkl" $pw
 Check (Wait-Until { Test-Path $file } 10) 'open restores the file in place'
+# The record is written when the session starts, a moment after the file is restored.
+$null = Wait-Until { $null -ne (Get-Record $file) } 10
 $rec = Get-Record $file
 Check ($null -ne $rec) 'crash-recovery record written'
 Check ($null -ne $rec -and -not [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($rec.FullName)).Contains('diary') -and

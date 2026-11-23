@@ -22,9 +22,9 @@ not by guessing: every change you make is checked against a screenshot you took 
 
 - C# 5 / .NET Framework 4.8, compiled by `build.ps1` with the csc.exe that ships with Windows.
   **C# 5 only:** no `$"..."` interpolation, no `?.`, no `nameof`, no `=>` members.
-- Dialogs: `PasswordForm(bool isLock, string itemName, string errorText)` (lock: password + confirm +
+- Dialogs: `PasswordForm(bool isLock, string itemName, string errorText, string note, Func<bool> keyProbe)` (lock: password + confirm +
   warning; unlock/open: one password + error line) and `ProgressForm` (marquee while working), both in
-  `src/Dialogs.cs`. Font Segoe UI 9pt, `AutoScaleMode.Dpi`, fixed-size dialogs laid out with coordinates.
+  `src/Dialogs.cs`; `MainForm` and `AddKeyForm` (security keys) in `src/MainForm.cs`. Font Segoe UI 9pt, `AutoScaleMode.Dpi`, fixed-size dialogs laid out with coordinates.
 - Windows Forms on .NET Framework has no dark mode: dialogs use system colours. "Light and dark" here
   means: check the dialog stays readable with Windows in dark mode (title bar only changes) and that the
   accent colours (warning orange, error red) have enough contrast on the light background. If real dark
@@ -67,8 +67,8 @@ function Shoot($form, $name) {
     $form.Close(); $form.Dispose(); $path
 }
 $pw = $asm.GetType('VaultKeep.PasswordForm').GetConstructors($flags)[0]
-Shoot ($pw.Invoke(@($true, 'Tax documents 2026', $null))) 'lock'
-Shoot ($pw.Invoke(@($false, 'Tax documents 2026.vkl', 'Wrong password. Try again.'))) 'unlock_error'
+Shoot ($pw.Invoke(@($true, 'Tax documents 2026', $null, 'Your security key "Blue USB" will also open it.', $null))) 'lock'
+Shoot ($pw.Invoke(@($false, 'Tax documents 2026.vkl', 'Wrong password. Try again.', 'Or plug in your VaultKeep security key.', $null))) 'unlock_error'
 $pr = $asm.GetType('VaultKeep.ProgressForm').GetConstructors($flags)[0]
 Shoot ($pr.Invoke(@('Locking Tax documents 2026...', [Action]{ }))) 'progress'
 ```

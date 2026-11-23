@@ -17,7 +17,12 @@ namespace VaultKeep
 
         public string Password { get { return _password.Text; } }
 
-        public PasswordForm(bool isLock, string itemName, string errorText)
+        /// <param name="note">Optional hint under the title (e.g. about security keys).</param>
+        /// <param name="keyProbe">
+        /// Optional check, run every 1.5 s, that returns true once a security key that fits is plugged in.
+        /// The dialog then closes with <see cref="DialogResult.Yes"/>.
+        /// </param>
+        public PasswordForm(bool isLock, string itemName, string errorText, string note, Func<bool> keyProbe)
         {
             _isLock = isLock;
 
@@ -31,7 +36,7 @@ namespace VaultKeep
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);
             Font = new Font("Segoe UI", 9F);
-            ClientSize = new Size(380, isLock ? 250 : 190);
+            ClientSize = new Size(380, (isLock ? 250 : 190) + (note != null ? 24 : 0));
             Icon = Shell.AppIcon;
 
             int y = 14;
@@ -45,6 +50,34 @@ namespace VaultKeep
             };
             Controls.Add(title);
             y += 30;
+
+            if (note != null)
+            {
+                Controls.Add(new Label
+                {
+                    Text = note,
+                    ForeColor = SystemColors.GrayText,
+                    AutoEllipsis = true,
+                    Location = new Point(14, y - 4),
+                    Size = new Size(352, 20)
+                });
+                y += 24;
+            }
+
+            if (keyProbe != null)
+            {
+                var probe = new System.Windows.Forms.Timer { Interval = 1500 };
+                probe.Tick += delegate
+                {
+                    probe.Stop();
+                    bool found = false;
+                    try { found = keyProbe(); } catch { }
+                    if (found) { DialogResult = DialogResult.Yes; Close(); }
+                    else probe.Start();
+                };
+                Shown += delegate { probe.Start(); };
+                FormClosed += delegate { probe.Stop(); probe.Dispose(); };
+            }
 
             Controls.Add(new Label { Text = "Password:", Location = new Point(14, y + 3), Size = new Size(110, 20) });
             _password = new TextBox { UseSystemPasswordChar = true, Location = new Point(128, y), Size = new Size(238, 23) };

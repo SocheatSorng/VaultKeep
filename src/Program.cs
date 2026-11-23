@@ -1,34 +1,41 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("VaultKeep")]
 [assembly: System.Reflection.AssemblyProduct("VaultKeep")]
-[assembly: System.Reflection.AssemblyVersion("0.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
 
 namespace VaultKeep
 {
     internal static class Program
     {
         private const string AppName = "VaultKeep";
+        private static string[] _args = new string[0];
 
         /// <summary>
         /// Usage:
-        ///   VaultKeep.exe                       -> install / uninstall the right-click menu
+        ///   VaultKeep.exe                       -> VaultKeep window: right-click menu + security keys
         ///   VaultKeep.exe install | uninstall
         ///   VaultKeep.exe lock   "path"         -> prompt for password, lock file/folder
-        ///   VaultKeep.exe open   "path.vkl"     -> prompt for password, open it, re-lock when it's closed
-        ///   VaultKeep.exe unlock "path.vkl"     -> prompt for password, unlock permanently
+        ///   VaultKeep.exe open   "path.vkl"     -> security key or password, open it, re-lock when it's closed
+        ///   VaultKeep.exe unlock "path.vkl"     -> security key or password, unlock permanently
+        ///   VaultKeep.exe key-create "E:\"      -> make a USB drive a security key (asks first)
         ///   VaultKeep.exe recover               -> offer to re-lock items left unlocked by a crash
-        ///   add --password-stdin to lock/open/unlock to read the password from stdin (no dialogs; for scripts/tests)
-        ///   add --no-launch to open to skip launching the item, --guard-seconds N to shorten the late-save watch (tests)
+        /// Script mode (no dialogs; for scripts/tests):
+        ///   --password-stdin    lock/open/unlock read the password from stdin (open/unlock try keys first)
+        ///   --quiet             key-create "dir" [--label L] | key-remove ID | key-list
+        ///   --key-dir DIR       also look for a key in DIR (repeatable); --no-drive-scan skips real drives
+        ///   --no-launch, --guard-seconds N   (open) skip launching the item / shorten the late-save watch
         /// </summary>
         [STAThread]
         private static int Main(string[] args)
         {
-            bool stdinMode = Array.IndexOf(args, "--password-stdin") >= 0;
-            if (!stdinMode)
+            _args = args;
+            bool quiet = HasFlag("--password-stdin") || HasFlag("--quiet");
+            if (!quiet)
             {
                 try { SetProcessDPIAware(); } catch { }
                 Application.EnableVisualStyles();
@@ -36,24 +43,35 @@ namespace VaultKeep
             }
 
             string command = args.Length > 0 ? args[0].ToLowerInvariant() : "";
-            string path = args.Length > 1 ? args[1] : null;
+            string path = PathArgument();
 
             try
             {
-                if (!stdinMode && command != "uninstall")
+                if (!quiet && command != "uninstall")
                     Recovery.PromptForOrphans();
 
                 switch (command)
                 {
                     case "open":
                         if (!RequirePath(path)) return 1;
-                        return stdinMode ? OpenQuiet(path, Array.IndexOf(args, "--no-launch") < 0, GuardSeconds(args)) : OpenInteractive(path);
+                        return quiet ? OpenQuiet(path, !HasFlag("--no-launch"), GuardSeconds()) : OpenInteractive(path);
+                    case "unlock":
+                        if (!RequirePath(path)) return 1;
+                        return quiet ? UnlockQuiet(path) : UnlockInteractive(path);
+                    case "lock":
+                        if (!RequirePath(path)) return 1;
+                        return quiet ? LockQuiet(path) : LockInteractive(path);
                     case "recover":
                         return 0; // orphan check above is all this does (runs at sign-in)
-                    case "lock":
-                        return RequirePath(path) ? (stdinMode ? LockQuiet(path) : LockInteractive(path)) : 1;
-                    case "unlock":
-                        return RequirePath(path) ? (stdinMode ? UnlockQuiet(path) : UnlockInteractive(path)) : 1;
+                    case "key-create":
+                        if (!RequirePath(path)) return 1;
+                        return quiet ? KeyCreateQuiet(path) : (MainForm.CreateKeyOnDrive(null, path) ? 0 : 2);
+                    case "key-remove":
+                        if (!RequirePath(path)) return 1;
+                        return KeyStore.Unregister(KeyStore.FromHex(path)) ? 0 : 1;
+                    case "key-list":
+                        foreach (RegisteredKey k in KeyStore.LoadRegistered()) Console.WriteLine(k.IdHex + "\t" + k.Label);
+                        return 0;
                     case "install":
                         Shell.Install();
                         Info("The \"Lock with VaultKeep\" option was added to the right-click menu for files and folders.");
@@ -63,7 +81,9 @@ namespace VaultKeep
                         Info("VaultKeep was removed from the right-click menu. Your locked .vkl files are not affected.");
                         return 0;
                     case "":
-                        return SetupPrompt();
+                    case "keys":
+                        Application.Run(new MainForm());
+                        return 0;
                     default:
                         Error("Unknown command: " + args[0]);
                         return 1;
@@ -71,7 +91,7 @@ namespace VaultKeep
             }
             catch (Exception ex)
             {
-                if (stdinMode) Console.Error.WriteLine(ex.Message);
+                if (quiet) Console.Error.WriteLine(ex.Message);
                 else Error(ex.Message);
                 return 1;
             }
@@ -94,15 +114,25 @@ namespace VaultKeep
         internal static bool LockWithPrompt(string path, bool replaceStale)
         {
             string name = Path.GetFileName(Path.GetFullPath(path).TrimEnd('\\'));
+            List<RegisteredKey> registered = RegisteredKeysOrEmpty();
+            string note = registered.Count == 0 ? null
+                : registered.Count == 1 ? "Your security key \"" + registered[0].Label + "\" will also open it."
+                : "Your " + registered.Count + " security keys will also open it.";
+
             string password;
-            using (var f = new PasswordForm(true, name, null))
+            using (var f = new PasswordForm(true, name, null, note, null))
             {
                 if (f.ShowDialog() != DialogResult.OK) return false;
                 password = f.Password;
             }
 
             LockResult result = null;
-            ProgressForm.Run("Locking " + name + "...", delegate { result = VaultCrypto.Lock(path, password, replaceStale); });
+            ProgressForm.Run("Locking " + name + "...", delegate
+            {
+                VaultKeys keys = VaultKeys.CreateNew(password, registered);
+                try { result = VaultCrypto.Lock(path, keys, replaceStale); }
+                finally { keys.Clear(); }
+            });
 
             if (result.UndeletedItems.Count > 0)
             {
@@ -117,25 +147,30 @@ namespace VaultKeep
         /// <summary>Default double-click action: unlock for use, open it, re-lock when it's closed.</summary>
         private static int OpenInteractive(string path)
         {
-            string password;
-            string restored = PromptAndUnlock(path, "Opening", out password);
+            VaultKeys keys;
+            string restored = PromptAndUnlock(path, "Opening", out keys);
             if (restored == null) return 2;
-            Application.Run(new OpenSession(restored, password, true, OpenSession.DefaultGuardSeconds));
+            Application.Run(new OpenSession(restored, keys, true, OpenSession.DefaultGuardSeconds));
             return 0;
         }
 
         /// <summary>"Unlock permanently": restore the original and stop protecting it.</summary>
         private static int UnlockInteractive(string path)
         {
-            string password;
-            return PromptAndUnlock(path, "Unlocking", out password) != null ? 0 : 2;
+            VaultKeys keys;
+            string restored = PromptAndUnlock(path, "Unlocking", out keys);
+            if (keys != null) keys.Clear();
+            return restored != null ? 0 : 2;
         }
 
-        /// <summary>Asks for the password (retrying on a wrong one) and restores the item in place.</summary>
+        /// <summary>
+        /// Opens the item with a plugged-in security key if one fits; otherwise asks for the password
+        /// (the dialog also notices a key being plugged in while it's open). Restores the item in place.
+        /// </summary>
         /// <returns>Path of the restored item, or null if the user cancelled.</returns>
-        private static string PromptAndUnlock(string path, string verb, out string password)
+        private static string PromptAndUnlock(string path, string verb, out VaultKeys keys)
         {
-            password = null;
+            keys = null;
             string name = Path.GetFileName(path);
             if (!VaultCrypto.IsVaultFile(path))
             {
@@ -144,54 +179,49 @@ namespace VaultKeep
             }
 
             string error = null;
+            bool showKeyHint = RegisteredKeysOrEmpty().Count > 0;
             while (true)
             {
-                string pwd;
-                using (var f = new PasswordForm(false, name, error))
+                KeyFile key = VaultCrypto.FindKeyFor(path, FindKeys());
+                if (key != null)
                 {
-                    if (f.ShowDialog() != DialogResult.OK) return null;
+                    try
+                    {
+                        UnlockResult r = null;
+                        ProgressForm.Run(verb + " " + name + " with security key \"" + key.Label + "\"...",
+                            delegate { r = VaultCrypto.Unlock(path, null, new[] { key }); });
+                        keys = r.Keys;
+                        return r.Restored;
+                    }
+                    catch (WrongPasswordException)
+                    {
+                        error = "The security key didn't open it (the file may be damaged). Try the password.";
+                    }
+                }
+
+                string pwd;
+                using (var f = new PasswordForm(false, name, error,
+                    showKeyHint ? "Or plug in your VaultKeep security key." : null,
+                    () => VaultCrypto.FindKeyFor(path, FindKeys()) != null))
+                {
+                    DialogResult answer = f.ShowDialog();
+                    if (answer == DialogResult.Yes) { error = null; continue; } // a key was plugged in
+                    if (answer != DialogResult.OK) return null;
                     pwd = f.Password;
                 }
                 try
                 {
-                    string restored = null;
-                    ProgressForm.Run(verb + " " + name + "...", delegate { restored = VaultCrypto.Unlock(path, pwd); });
-                    password = pwd;
-                    return restored;
+                    UnlockResult r = null;
+                    ProgressForm.Run(verb + " " + name + "...", delegate { r = VaultCrypto.Unlock(path, pwd, null); });
+                    // Items from VaultKeep 0.1 have no key slots yet: give them new keys so re-locking upgrades them.
+                    keys = r.Keys ?? VaultKeys.CreateNew(pwd, RegisteredKeysOrEmpty());
+                    return r.Restored;
                 }
                 catch (WrongPasswordException)
                 {
                     error = "Wrong password. Try again.";
                 }
             }
-        }
-
-        private static int SetupPrompt()
-        {
-            if (Shell.IsInstalled())
-            {
-                var r = MessageBox.Show(
-                    "VaultKeep is in your right-click menu.\n\nDo you want to remove it?\n" +
-                    "(Your locked .vkl files stay locked and can be unlocked after reinstalling.)",
-                    AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (r == DialogResult.Yes) { Shell.Uninstall(); Info("VaultKeep was removed from the right-click menu."); }
-            }
-            else
-            {
-                var r = MessageBox.Show(
-                    "Add \"Lock with VaultKeep\" to the right-click menu for files and folders?",
-                    AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (r == DialogResult.Yes)
-                {
-                    Shell.Install();
-                    Info("Done! Right-click any file or folder and choose \"Lock with VaultKeep\".\n\n" +
-                         "To use a locked item, double-click its .vkl file and enter the password. It opens normally " +
-                         "and locks again automatically when you close it.\n" +
-                         "To remove the lock for good, right-click the .vkl file and choose \"Unlock permanently\".\n\n" +
-                         "Keep VaultKeep.exe in this folder; if you move it, run it again to update the menu.");
-                }
-            }
-            return 0;
         }
 
         // ---------------------------------------------------------- Script mode
@@ -204,51 +234,125 @@ namespace VaultKeep
                 Console.Error.WriteLine("Password must be at least " + PasswordForm.MinPasswordLength + " characters.");
                 return 1;
             }
-            var result = VaultCrypto.Lock(path, password);
+            VaultKeys keys = VaultKeys.CreateNew(password, KeyStore.LoadRegistered());
+            LockResult result;
+            try { result = VaultCrypto.Lock(path, keys, false); }
+            finally { keys.Clear(); }
             Console.WriteLine(result.OutputPath);
             foreach (string s in result.UndeletedItems) Console.Error.WriteLine("Could not delete: " + s);
             return result.UndeletedItems.Count == 0 ? 0 : 3;
         }
 
-        private static int OpenQuiet(string path, bool launch, int guardSeconds)
+        /// <summary>Unlocks with a fitting key if one is found, else with the password from stdin.</summary>
+        private static UnlockResult UnlockQuietCore(string path, out int exitCode)
         {
-            string password = Console.In.ReadLine() ?? "";
-            string restored;
-            try { restored = VaultCrypto.Unlock(path, password); }
+            exitCode = 0;
+            KeyFile key = VaultCrypto.FindKeyFor(path, FindKeys());
+            try
+            {
+                if (key != null)
+                    return VaultCrypto.Unlock(path, null, new[] { key });
+                string password = Console.In.ReadLine() ?? "";
+                UnlockResult r = VaultCrypto.Unlock(path, password, null);
+                if (r.Keys == null) r.Keys = VaultKeys.CreateNew(password, KeyStore.LoadRegistered());
+                return r;
+            }
             catch (WrongPasswordException ex)
             {
                 Console.Error.WriteLine(ex.Message);
-                return 4;
+                exitCode = 4;
+                return null;
             }
-            Console.WriteLine(restored);
+        }
+
+        private static int OpenQuiet(string path, bool launch, int guardSeconds)
+        {
+            int code;
+            UnlockResult r = UnlockQuietCore(path, out code);
+            if (r == null) return code;
+            Console.WriteLine(r.Restored + (r.UsedKey != null ? "\tkey" : "\tpassword"));
             Console.Out.Flush();
-            Application.Run(new OpenSession(restored, password, launch, guardSeconds));
+            Application.Run(new OpenSession(r.Restored, r.Keys, launch, guardSeconds));
             return 0;
         }
 
         private static int UnlockQuiet(string path)
         {
-            string password = Console.In.ReadLine() ?? "";
-            try
-            {
-                Console.WriteLine(VaultCrypto.Unlock(path, password));
-                return 0;
-            }
-            catch (WrongPasswordException ex)
-            {
-                Console.Error.WriteLine(ex.Message);
-                return 4;
-            }
+            int code;
+            UnlockResult r = UnlockQuietCore(path, out code);
+            if (r == null) return code;
+            Console.WriteLine(r.Restored + (r.UsedKey != null ? "\tkey" : "\tpassword"));
+            if (r.Keys != null) r.Keys.Clear();
+            return 0;
+        }
+
+        private static int KeyCreateQuiet(string root)
+        {
+            string label = OptionValue("--label") ?? "Test key";
+            KeyFile key = KeyStore.CreateKey(root, label);
+            Console.WriteLine(key.IdHex);
+            return 0;
         }
 
         // ---------------------------------------------------------------- Misc
 
-        /// <summary>Test option "--guard-seconds N": how long to watch for late saves after re-locking.</summary>
-        private static int GuardSeconds(string[] args)
+        /// <summary>Keys on plugged-in drives, plus --key-dir folders (tests).</summary>
+        internal static List<KeyFile> FindKeys()
         {
-            int i = Array.IndexOf(args, "--guard-seconds");
+            var extra = new List<string>();
+            for (int i = 0; i < _args.Length - 1; i++)
+                if (_args[i] == "--key-dir") extra.Add(_args[i + 1]);
+            return KeyStore.FindKeyFiles(extra, !HasFlag("--no-drive-scan"));
+        }
+
+        internal static List<RegisteredKey> RegisteredKeysOrEmpty()
+        {
+            try { return KeyStore.LoadRegistered(); }
+            catch { return new List<RegisteredKey>(); }
+        }
+
+        private static readonly string[] OptionsWithValue = { "--label", "--key-dir", "--guard-seconds" };
+
+        /// <summary>
+        /// The first argument after the command that isn't an option, cleaned up. Explorer passes a drive as
+        /// "E:\" and Windows reads the closing \" as an escaped quote, so the program receives E:" (and would
+        /// swallow any following arguments into it). Stray quotes are removed and a bare "E:" becomes "E:\".
+        /// </summary>
+        private static string PathArgument()
+        {
+            for (int i = 1; i < _args.Length; i++)
+            {
+                if (Array.IndexOf(OptionsWithValue, _args[i]) >= 0) { i++; continue; }
+                if (_args[i].StartsWith("--")) continue;
+                return NormalizePath(_args[i]);
+            }
+            return null;
+        }
+
+        internal static string NormalizePath(string raw)
+        {
+            if (raw == null) return null;
+            string p = raw.Replace("\"", "").Trim();
+            if (p.Length == 2 && p[1] == ':') p += "\\";
+            return p.Length == 0 ? null : p;
+        }
+
+        private static bool HasFlag(string flag)
+        {
+            return Array.IndexOf(_args, flag) >= 0;
+        }
+
+        private static string OptionValue(string name)
+        {
+            int i = Array.IndexOf(_args, name);
+            return i >= 0 && i + 1 < _args.Length ? _args[i + 1] : null;
+        }
+
+        /// <summary>Test option "--guard-seconds N": how long to watch for late saves after re-locking.</summary>
+        private static int GuardSeconds()
+        {
             int value;
-            if (i >= 0 && i + 1 < args.Length && int.TryParse(args[i + 1], out value) && value >= 0) return value;
+            if (int.TryParse(OptionValue("--guard-seconds"), out value) && value >= 0) return value;
             return OpenSession.DefaultGuardSeconds;
         }
 
@@ -259,9 +363,9 @@ namespace VaultKeep
             return false;
         }
 
-        private static void Info(string msg) { MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Information); }
-        private static void Warn(string msg) { MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
-        private static void Error(string msg) { MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        internal static void Info(string msg) { MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Information); }
+        internal static void Warn(string msg) { MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        internal static void Error(string msg) { MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error); }
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();

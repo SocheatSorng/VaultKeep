@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
@@ -27,7 +27,7 @@ namespace VaultKeep
 
         private readonly string _path;
         private readonly string _name;
-        private readonly string _password;
+        private readonly VaultKeys _keys;
         private readonly bool _isFolder;
         private readonly int _guardSeconds;
         private readonly InUseDetector _detector;
@@ -42,11 +42,11 @@ namespace VaultKeep
         private DateTime _guardUntil;
         private bool _finished;
 
-        public OpenSession(string path, string password, bool launch, int guardSeconds)
+        public OpenSession(string path, VaultKeys keys, bool launch, int guardSeconds)
         {
             _path = Path.GetFullPath(path).TrimEnd('\\');
             _name = Path.GetFileName(_path);
-            _password = password;
+            _keys = keys;
             _isFolder = Directory.Exists(_path);
             _guardSeconds = guardSeconds;
             _detector = new InUseDetector(_path, _isFolder);
@@ -167,7 +167,7 @@ namespace VaultKeep
                 Exception error = null;
                 // replaceStale: an older .vkl of this same item may still be there (e.g. a late save, or the
                 // .vkl could not be deleted when it was opened). The new copy has the latest content.
-                try { result = VaultCrypto.Lock(_path, _password, true); }
+                try { result = VaultCrypto.Lock(_path, CurrentKeys(), true); }
                 catch (Exception ex) { error = ex; }
                 if (_finished) return;
                 _ui.BeginInvoke(new Action(() => OnRelocked(result, error, lateSave)));
@@ -231,12 +231,20 @@ namespace VaultKeep
                 bool present = _isFolder ? Directory.Exists(_path) && !_guarding : File.Exists(_path);
                 if (present && _detector.GetUseReason() == null)
                 {
-                    VaultCrypto.Lock(_path, _password, true);
+                    VaultCrypto.Lock(_path, CurrentKeys(), true);
                     Recovery.Remove(_record);
                     _finished = true;
                 }
             }
             catch { }
+        }
+
+        /// <summary>The item's keys, with USB-key slots updated to the keys registered on this PC right now.</summary>
+        private VaultKeys CurrentKeys()
+        {
+            try { _keys.SyncKeySlots(KeyStore.LoadRegistered()); }
+            catch { } // key list unreadable: keep the slots the item already had
+            return _keys;
         }
 
         private void Notify(string message, ToolTipIcon icon)
@@ -283,7 +291,7 @@ namespace VaultKeep
 
         private static string Dir
         {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"VaultKeep\open"); }
+            get { return Path.Combine(AppPaths.DataDir, "open"); }
         }
 
         public static string Add(string path)

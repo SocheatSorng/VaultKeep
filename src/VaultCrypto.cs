@@ -8,14 +8,16 @@ namespace VaultKeep
 {
     /// <summary>
     /// .vkl file layout (all integers little-endian):
-    ///   magic "VKL1" (4) | version (1) | kind (1) | iterations (int32) | salt (16) | iv (16)
-    ///   | AES-256-CBC ciphertext of the payload | HMAC-SHA256 over everything before it (32)
-    ///
-    /// Keys:
-    ///   version 2 (written now): master = PBKDF2-HMAC-SHA256(password, salt, iterations) -> 32 bytes;
-    ///     encKey = HMAC-SHA256(master, "VaultKeep v2 enc"), macKey = HMAC-SHA256(master, "VaultKeep v2 mac").
-    ///     One PBKDF2 block, so the user pays the same work per guess as an attacker does.
-    ///   version 1 (read only): PBKDF2-HMAC-SHA256 -> 64 bytes = encKey(32) + macKey(32).
+    ///   version 3 (written now):
+    ///     magic "VKL1" (4) | version (1) | kind (1) | slot count (1) | slots... | iv (16)
+    ///     | AES-256-CBC ciphertext of the payload | HMAC-SHA256 over everything before it (32)
+    ///     encKey/macKey come from a random data key that each slot wraps: the password, or a USB
+    ///     security key. See VaultKeys.cs for the slot format.
+    ///   versions 1 and 2 (read only, password only):
+    ///     magic (4) | version (1) | kind (1) | iterations (int32) | salt (16) | iv (16) | ciphertext | HMAC (32)
+    ///     v2: master = PBKDF2-HMAC-SHA256(password, salt, iterations) -> 32 bytes;
+    ///         encKey = HMAC(master, "VaultKeep v2 enc"), macKey = HMAC(master, "VaultKeep v2 mac").
+    ///     v1: PBKDF2-HMAC-SHA256 -> 64 bytes = encKey(32) + macKey(32).
     ///
     /// Payload (BinaryWriter format, strings are length-prefixed UTF-8):
     ///   kind = file:   name | lastWriteUtcTicks (int64) | length (int64) | bytes
@@ -29,16 +31,17 @@ namespace VaultKeep
         public const int DefaultIterations = 600000; // OWASP 2023+ guidance for PBKDF2-HMAC-SHA256
 
         private static readonly byte[] Magic = { (byte)'V', (byte)'K', (byte)'L', (byte)'1' };
-        private const byte FormatVersion = 2;
+        private const byte FormatVersion = 3;
         private const byte OldestReadableVersion = 1;
         private const byte KindFile = 0;
         private const byte KindFolder = 1;
         private const int SaltSize = 16;
         private const int IvSize = 16;
         private const int MacSize = 32;
-        private const int HeaderSize = 4 + 1 + 1 + 4 + SaltSize + IvSize;
-        private const int MinIterations = 10000;
-        private const int MaxIterations = 10000000;
+        private const int LegacyHeaderSize = 4 + 1 + 1 + 4 + SaltSize + IvSize;
+        internal const int MinIterations = 10000;
+        internal const int MaxIterations = 10000000;
+        private const int MaxSlots = 32;
         private const byte EntryEnd = 0;
         private const byte EntryDir = 1;
         private const byte EntryFile = 2;
@@ -51,12 +54,7 @@ namespace VaultKeep
         /// Replace an existing "&lt;name&gt;.vkl" (an older locked copy of this same item, e.g. left behind when
         /// re-locking after use). When false, an existing .vkl is an error so nothing is ever overwritten.
         /// </param>
-        public static LockResult Lock(string sourcePath, string password)
-        {
-            return Lock(sourcePath, password, false);
-        }
-
-        public static LockResult Lock(string sourcePath, string password, bool replaceStale)
+        public static LockResult Lock(string sourcePath, VaultKeys keys, bool replaceStale)
         {
             string full = Path.GetFullPath(sourcePath).TrimEnd('\\');
             bool isFolder = Directory.Exists(full);
@@ -88,17 +86,17 @@ namespace VaultKeep
             // power cut never leaves a half-written file under the real .vkl name.
             string temp = Path.Combine(parent, "." + name + ".vkl-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
 
-            byte[] salt = RandomBytes(SaltSize);
+            if (!keys.HasPasswordSlot) // the password must always work, whatever keys exist
+                throw new InvalidOperationException("Internal error: locked item would have no password slot.");
             byte[] iv = RandomBytes(IvSize);
-            byte[] encKey, macKey;
-            DeriveKeys(password, salt, DefaultIterations, FormatVersion, out encKey, out macKey);
+            byte[] encKey = keys.EncKey, macKey = keys.MacKey;
 
             try
             {
                 using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
                 {
                     File.SetAttributes(temp, FileAttributes.Hidden);
-                    WriteHeader(fs, isFolder ? KindFolder : KindFile, DefaultIterations, salt, iv);
+                    WriteHeader(fs, isFolder ? KindFolder : KindFile, keys.Slots, iv);
 
                     using (var aes = CreateAes(encKey, iv))
                     using (var encryptor = aes.CreateEncryptor())
@@ -194,27 +192,72 @@ namespace VaultKeep
 
         // ---------------------------------------------------------------- Unlock
 
-        /// <summary>Decrypts a .vkl file back to its original file/folder next to it, then deletes the .vkl.</summary>
-        /// <returns>Path of the restored file or folder.</returns>
-        /// <exception cref="WrongPasswordException">Password is wrong or the file was tampered with.</exception>
-        public static string Unlock(string vklPath, string password)
+        /// <summary>Returns the first of <paramref name="keys"/> that can open this .vkl, or null.</summary>
+        public static KeyFile FindKeyFor(string vklPath, IList<KeyFile> keys)
+        {
+            if (keys == null || keys.Count == 0) return null;
+            try
+            {
+                using (var fs = new FileStream(vklPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    Header h = ReadHeader(fs);
+                    if (h.Slots == null) return null;
+                    foreach (KeyFile k in keys)
+                        if (VaultKeys.HasSlotFor(h.Slots, k)) return k;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// Decrypts a .vkl file back to its original file/folder next to it, then deletes the .vkl.
+        /// Tries the USB keys in <paramref name="keys"/> first, then <paramref name="password"/> (either may be null).
+        /// </summary>
+        /// <exception cref="WrongPasswordException">No key fits and the password is wrong, or the file was tampered with.</exception>
+        /// <exception cref="NeedPasswordException">No key fits and no password was given.</exception>
+        public static UnlockResult Unlock(string vklPath, string password, IList<KeyFile> keys)
         {
             string full = Path.GetFullPath(vklPath);
             string parent = Path.GetDirectoryName(full);
-            string restored;
+            var result = new UnlockResult();
 
             using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
             {
-                if (fs.Length < HeaderSize + IvSize + MacSize)
+                if (fs.Length < LegacyHeaderSize + IvSize + MacSize)
                     throw new InvalidDataException("This is not a valid VaultKeep file.");
 
-                byte version, kind;
-                int iterations;
-                byte[] salt, iv;
-                ReadHeader(fs, out version, out kind, out iterations, out salt, out iv);
+                Header h = ReadHeader(fs);
+                byte kind = h.Kind;
+                byte[] iv = h.Iv;
+                long cipherStart = fs.Position;
 
                 byte[] encKey, macKey;
-                DeriveKeys(password, salt, iterations, version, out encKey, out macKey);
+                if (h.Slots == null)
+                {
+                    // v1/v2: password only. Re-locking will upgrade the item to v3.
+                    if (password == null) throw new NeedPasswordException();
+                    DeriveKeys(password, h.Salt, h.Iterations, h.Version, out encKey, out macKey);
+                }
+                else
+                {
+                    byte[] dek = null;
+                    if (keys != null)
+                        foreach (KeyFile k in keys)
+                        {
+                            dek = VaultKeys.OpenWithKey(h.Slots, k);
+                            if (dek != null) { result.UsedKey = k; break; }
+                        }
+                    if (dek == null && password != null) dek = VaultKeys.OpenWithPassword(h.Slots, password);
+                    if (dek == null)
+                    {
+                        if (password == null) throw new NeedPasswordException();
+                        throw new WrongPasswordException();
+                    }
+                    result.Keys = VaultKeys.FromExisting(dek, h.Slots);
+                    encKey = result.Keys.EncKey;
+                    macKey = result.Keys.MacKey;
+                }
                 try
                 {
                     long macOffset = fs.Length - MacSize;
@@ -226,8 +269,8 @@ namespace VaultKeep
                     if (!FixedTimeEquals(expected, stored))
                         throw new WrongPasswordException();
 
-                    fs.Position = HeaderSize;
-                    var cipher = new LimitedReadStream(fs, macOffset - HeaderSize);
+                    fs.Position = cipherStart;
+                    var cipher = new LimitedReadStream(fs, macOffset - cipherStart);
                     using (var aes = CreateAes(encKey, iv))
                     using (var decryptor = aes.CreateDecryptor())
                     using (var cs = new CryptoStream(cipher, decryptor, CryptoStreamMode.Read))
@@ -235,7 +278,7 @@ namespace VaultKeep
                     {
                         string name = r.ReadString();
                         ValidateName(name);
-                        restored = Path.Combine(parent, name);
+                        string restored = Path.Combine(parent, name);
                         if (File.Exists(restored) || Directory.Exists(restored))
                             throw new IOException("\"" + name + "\" already exists in this folder. Move or rename it, then try again.");
 
@@ -246,6 +289,7 @@ namespace VaultKeep
                             RestoreFolder(r, parent, restored, buffer);
                         else
                             throw new InvalidDataException("Unknown item type in VaultKeep file.");
+                        result.Restored = restored;
                     }
                 }
                 finally
@@ -256,7 +300,7 @@ namespace VaultKeep
             }
 
             TryDeleteFile(full);
-            return restored;
+            return result;
         }
 
         private static void RestoreFile(BinaryReader r, string target, byte[] buffer)
@@ -336,35 +380,71 @@ namespace VaultKeep
             catch { return false; }
         }
 
-        private static void WriteHeader(Stream s, byte kind, int iterations, byte[] salt, byte[] iv)
+        private static void WriteHeader(Stream s, byte kind, IList<byte[]> slots, byte[] iv)
         {
+            if (slots.Count == 0 || slots.Count > MaxSlots) throw new InvalidOperationException("Bad number of key slots.");
             s.Write(Magic, 0, Magic.Length);
             s.WriteByte(FormatVersion);
             s.WriteByte(kind);
-            s.Write(BitConverter.GetBytes(iterations), 0, 4);
-            s.Write(salt, 0, salt.Length);
+            s.WriteByte((byte)slots.Count);
+            foreach (byte[] slot in slots) s.Write(slot, 0, slot.Length);
             s.Write(iv, 0, iv.Length);
         }
 
-        private static void ReadHeader(Stream s, out byte version, out byte kind, out int iterations, out byte[] salt, out byte[] iv)
+        private sealed class Header
         {
-            byte[] h = new byte[HeaderSize];
-            ReadExact(s, h, HeaderSize);
+            public byte Version, Kind;
+            public int Iterations;     // v1/v2
+            public byte[] Salt;        // v1/v2
+            public List<byte[]> Slots; // v3 (null for v1/v2)
+            public byte[] Iv;
+        }
+
+        /// <summary>Reads the header; leaves the stream positioned at the start of the ciphertext.</summary>
+        private static Header ReadHeader(Stream s)
+        {
+            byte[] start = new byte[6];
+            ReadExact(s, start, 6);
             for (int i = 0; i < Magic.Length; i++)
-                if (h[i] != Magic[i]) throw new InvalidDataException("This is not a VaultKeep file.");
-            version = h[4];
-            if (version > FormatVersion)
+                if (start[i] != Magic[i]) throw new InvalidDataException("This is not a VaultKeep file.");
+            var h = new Header { Version = start[4], Kind = start[5] };
+            if (h.Version > FormatVersion)
                 throw new InvalidDataException("This file was made by a newer version of VaultKeep.");
-            if (version < OldestReadableVersion)
+            if (h.Version < OldestReadableVersion)
                 throw new InvalidDataException("Corrupt VaultKeep file header.");
-            kind = h[5];
-            iterations = BitConverter.ToInt32(h, 6);
-            if (iterations < MinIterations || iterations > MaxIterations)
+
+            if (h.Version >= 3)
+            {
+                int count = s.ReadByte();
+                if (count < 1 || count > MaxSlots) throw new InvalidDataException("Corrupt VaultKeep file header.");
+                h.Slots = new List<byte[]>();
+                for (int i = 0; i < count; i++)
+                {
+                    byte[] th = new byte[3];
+                    ReadExact(s, th, 3);
+                    int len = th[1] | (th[2] << 8);
+                    byte[] slot = new byte[3 + len];
+                    Buffer.BlockCopy(th, 0, slot, 0, 3);
+                    byte[] data = new byte[len];
+                    ReadExact(s, data, len);
+                    Buffer.BlockCopy(data, 0, slot, 3, len);
+                    h.Slots.Add(slot);
+                }
+                h.Iv = new byte[IvSize];
+                ReadExact(s, h.Iv, IvSize);
+                return h;
+            }
+
+            byte[] rest = new byte[4 + SaltSize + IvSize];
+            ReadExact(s, rest, rest.Length);
+            h.Iterations = BitConverter.ToInt32(rest, 0);
+            if (h.Iterations < MinIterations || h.Iterations > MaxIterations)
                 throw new InvalidDataException("Corrupt VaultKeep file header.");
-            salt = new byte[SaltSize];
-            iv = new byte[IvSize];
-            Buffer.BlockCopy(h, 10, salt, 0, SaltSize);
-            Buffer.BlockCopy(h, 10 + SaltSize, iv, 0, IvSize);
+            h.Salt = new byte[SaltSize];
+            h.Iv = new byte[IvSize];
+            Buffer.BlockCopy(rest, 4, h.Salt, 0, SaltSize);
+            Buffer.BlockCopy(rest, 4 + SaltSize, h.Iv, 0, IvSize);
+            return h;
         }
 
         private static readonly byte[] EncLabel = Encoding.ASCII.GetBytes("VaultKeep v2 enc");
@@ -541,6 +621,20 @@ namespace VaultKeep
             }
             catch { }
         }
+    }
+
+    internal sealed class UnlockResult
+    {
+        public string Restored;
+        /// <summary>The item's keys (v3), for re-locking; null for v1/v2 items (re-lock creates new keys).</summary>
+        public VaultKeys Keys;
+        /// <summary>The USB key that opened it, or null if the password did.</summary>
+        public KeyFile UsedKey;
+    }
+
+    internal sealed class NeedPasswordException : Exception
+    {
+        public NeedPasswordException() : base("No security key for this item is plugged in. Enter the password.") { }
     }
 
     internal sealed class LockResult

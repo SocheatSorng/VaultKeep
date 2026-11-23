@@ -21,7 +21,8 @@ Check (-not (Test-Path $folder)) 'original folder removed'
 Check (Test-Path "$folder.vkl") '.vkl created'
 $raw = [IO.File]::ReadAllBytes("$folder.vkl")
 Check (-not [Text.Encoding]::UTF8.GetString($raw).Contains('hello vault')) 'no plaintext inside .vkl'
-Check ($raw[4] -eq 2 -and [BitConverter]::ToInt32($raw, 6) -eq 600000) 'format v2 with 600,000 PBKDF2 rounds'
+# v3: magic(4) version(1) kind(1) slots(1) | password slot: type(1) len(2) iterations(4) ...
+Check ($raw[4] -eq 3 -and $raw[6] -eq 1 -and $raw[7] -eq 1 -and [BitConverter]::ToInt32($raw, 10) -eq 600000) 'format v3, one password slot with 600,000 PBKDF2 rounds'
 Check ($null -eq (Get-ChildItem $t -Force -Filter '*.tmp')) 'no temp file left after lock'
 
 $r = Invoke-VaultKeep unlock "$folder.vkl" $bad

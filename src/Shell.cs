@@ -17,6 +17,7 @@ namespace VaultKeep
         private const string Classes = @"Software\Classes\";
         private const string ProgId = "VaultKeep.Locked";
         private const string LockVerb = "VaultKeep.Lock";
+        private const string KeyVerb = "VaultKeep.MakeKey";
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string LockIcon = @"%SystemRoot%\System32\shell32.dll,47"; // padlock
 
@@ -77,6 +78,15 @@ namespace VaultKeep
                 using (var c = k.CreateSubKey("command")) c.SetValue("", lockCmd);
             }
 
+            // Drives: make a USB drive a security key.
+            using (var k = Registry.CurrentUser.CreateSubKey(Classes + @"Drive\shell\" + KeyVerb))
+            {
+                k.SetValue("", "Make VaultKeep security key");
+                k.SetValue("Icon", LockIcon, RegistryValueKind.ExpandString);
+                // %1 unquoted: a drive is passed as E:\ and a quoted "E:\" would end in an escaped quote.
+                using (var c = k.CreateSubKey("command")) c.SetValue("", "\"" + exe + "\" key-create %1");
+            }
+
             // Locked items (.vkl).
             using (var k = Registry.CurrentUser.CreateSubKey(Classes + VaultCrypto.Extension))
                 k.SetValue("", ProgId);
@@ -114,6 +124,7 @@ namespace VaultKeep
                 if (run != null) run.DeleteValue("VaultKeep", false);
             Registry.CurrentUser.DeleteSubKeyTree(Classes + @"*\shell\" + LockVerb, false);
             Registry.CurrentUser.DeleteSubKeyTree(Classes + @"Directory\shell\" + LockVerb, false);
+            Registry.CurrentUser.DeleteSubKeyTree(Classes + @"Drive\shell\" + KeyVerb, false);
             Registry.CurrentUser.DeleteSubKeyTree(Classes + ProgId, false);
             using (var k = Registry.CurrentUser.OpenSubKey(Classes + VaultCrypto.Extension))
             {
