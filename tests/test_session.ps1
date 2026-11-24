@@ -75,6 +75,44 @@ $r = Invoke-VaultKeep unlock "$folder.vkl" $pw
 Check ($r.Code -eq 0 -and (Get-Content "$folder\2026\a.txt") -eq 'x') 'folder content intact in the .vkl'
 $null = Invoke-VaultKeep lock $folder $pw
 
+Write-Host 'Back and Up in File Explorer lead to the original folder'
+function Get-ExplorerAt([string]$path) {
+    foreach ($w in @($shell.Windows())) {
+        try {
+            if ($w.LocationURL -and ([Uri]$w.LocationURL).LocalPath.TrimEnd('\') -ieq $path.TrimEnd('\')) { return $w }
+        } catch { }
+    }
+    return $null
+}
+# Explorer refuses a navigation while it is still busy with the previous one (HRESULT 0x800700AA): retry.
+function Invoke-Explorer($window, [scriptblock]$action) {
+    for ($i = 0; $i -lt 20; $i++) {
+        try { & $action $window; return } catch { Start-Sleep -Milliseconds 250 }
+    }
+    & $action $window
+}
+Start-Process explorer.exe -ArgumentList "`"$synced`""
+$null = Wait-Until { $null -ne (Get-ExplorerAt $synced) } 15
+$win = Get-ExplorerAt $synced
+$p = Start-OpenSession "$folder.vkl" $pw 0 @() -Launch   # like double-clicking Testing.vkl in that window
+$copy = Get-OpenCopy $p
+Check ($null -ne $copy -and (Wait-Until { $null -ne (Get-ExplorerAt $copy) } 15)) 'the folder opens in the same Explorer window'
+Check ($null -ne $win -and (([Uri]$win.LocationURL).LocalPath.TrimEnd('\') -ieq $copy.TrimEnd('\'))) '...the very window the .vkl was double-clicked in'
+function Get-WinPath { try { ([Uri]$win.LocationURL).LocalPath.TrimEnd('\') } catch { '' } }
+Invoke-Explorer $win { param($w) $w.GoBack() }
+Check (Wait-Until { (Get-WinPath) -ieq $synced } 10) 'Back returns to the original folder'
+Start-Sleep 1
+Invoke-Explorer $win { param($w) $w.Navigate2($copy) }
+$null = Wait-Until { (Get-WinPath) -ieq $copy.TrimEnd('\') } 10
+Start-Sleep 1
+Invoke-Explorer $win { param($w) $w.Navigate2((Split-Path $copy)) }   # what the Up button does
+Check (Wait-Until { (Get-WinPath) -ieq $synced } 10) 'Up into the private folder goes to the original folder instead'
+Start-Sleep 1
+Invoke-Explorer $win { param($w) $w.Navigate2((Get-WorkspaceRoot)) }
+Check (Wait-Until { (Get-WinPath) -ieq $synced } 10) 'the workspace itself redirects to the original folder too'
+Invoke-Explorer $win { param($w) $w.Quit() }
+Check (Wait-Until { -not (Test-Path $copy) -and $p.HasExited } 40) 're-locks after the window closes'
+
 Write-Host 'Unused item'
 $p = Start-OpenSession "$file.vkl" $pw
 $copy = Get-OpenCopy $p

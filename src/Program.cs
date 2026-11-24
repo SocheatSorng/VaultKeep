@@ -156,7 +156,8 @@ namespace VaultKeep
             {
                 // Already open: show the same copy again rather than making a second one whose
                 // re-lock could overwrite the first one's edits.
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(openCopy) { UseShellExecute = true });
+                if (!Directory.Exists(openCopy) || !ExplorerWindows.NavigateFrom(Path.GetDirectoryName(Path.GetFullPath(path)), openCopy))
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(openCopy) { UseShellExecute = true });
                 return 0;
             }
 

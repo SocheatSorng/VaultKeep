@@ -37,6 +37,7 @@ namespace VaultKeep
         private readonly InUseDetector _detector;
         private readonly NotifyIcon _tray;
         private readonly System.Windows.Forms.Timer _timer;
+        private readonly System.Windows.Forms.Timer _navTimer; // folders only
         private readonly DateTime _started = DateTime.UtcNow;
         private readonly Control _ui = new Control(); // marshals background results back to the UI thread
         private string _record;
@@ -82,6 +83,13 @@ namespace VaultKeep
             _timer.Tick += OnTick;
             _timer.Start();
 
+            if (_isFolder)
+            {
+                _navTimer = new System.Windows.Forms.Timer { Interval = 400 };
+                _navTimer.Tick += OnNavigationTick;
+                _navTimer.Start();
+            }
+
             SystemEvents.SessionEnding += OnSessionEnding;
 
             if (launch) Launch();
@@ -90,8 +98,24 @@ namespace VaultKeep
         private void Launch()
         {
             if (_guarding) return;
-            try { Process.Start(new ProcessStartInfo(_path) { UseShellExecute = true }); }
+            try
+            {
+                // A folder opens inside the Explorer window the .vkl was double-clicked in, so Back returns there.
+                if (_isFolder && ExplorerWindows.NavigateFrom(Path.GetDirectoryName(_vklPath), _path)) return;
+                Process.Start(new ProcessStartInfo(_path) { UseShellExecute = true });
+            }
             catch (Exception ex) { _tray.ShowBalloonTip(4000, "VaultKeep", "Couldn't open: " + ex.Message, ToolTipIcon.Warning); }
+        }
+
+        /// <summary>
+        /// Keeps Explorer windows out of VaultKeep's private folders: going Up from the open folder would land in
+        /// the session folder, the workspace or %LOCALAPPDATA%\VaultKeep. Send such windows to the folder the
+        /// .vkl is in instead, which is where the user expects "up" to lead.
+        /// </summary>
+        private void OnNavigationTick(object sender, EventArgs e)
+        {
+            if (_finished) { _navTimer.Stop(); return; }
+            ExplorerWindows.Redirect(new[] { _sessionDir, Workspace.Root, AppPaths.DataDir }, Path.GetDirectoryName(_vklPath));
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -275,6 +299,7 @@ namespace VaultKeep
         {
             _finished = true;
             _timer.Stop();
+            if (_navTimer != null) _navTimer.Stop();
             Recovery.Remove(_record);
             Workspace.RemoveIfEmpty(_sessionDir);
             SystemEvents.SessionEnding -= OnSessionEnding;

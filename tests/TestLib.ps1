@@ -54,10 +54,12 @@ function Invoke-VaultKeep([string]$verb, [string]$path, [string]$passwordFile, [
 
 # Starts an "open" session in the background (no app is launched). Returns the Process.
 # GuardSeconds: how long the session keeps watching for late saves after re-locking (0 = exit at once).
-function Start-OpenSession([string]$vkl, [string]$passwordFile, [int]$GuardSeconds = 0, [string[]]$extra = @()) {
+# -Launch opens the item like a real double-click (a folder opens in File Explorer).
+function Start-OpenSession([string]$vkl, [string]$passwordFile, [int]$GuardSeconds = 0, [string[]]$extra = @(), [switch]$Launch) {
     $id = [Guid]::NewGuid().ToString('N')
-    $argList = @('open', "`"$vkl`"", '--password-stdin', '--no-drive-scan', '--no-launch', '--guard-seconds', $GuardSeconds) +
+    $argList = @('open', "`"$vkl`"", '--password-stdin', '--no-drive-scan', '--guard-seconds', $GuardSeconds) +
         ($extra | ForEach-Object { "`"$_`"" })
+    if (-not $Launch) { $argList += '--no-launch' }
     $outFile = Join-Path $script:Out "$id.out"
     $p = Start-Process $script:Exe -ArgumentList $argList `
         -RedirectStandardInput $passwordFile -RedirectStandardOutput $outFile `
