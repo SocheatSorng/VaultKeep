@@ -18,6 +18,15 @@ the `.vkl` and the private copy is removed. So a sync app only ever uploads the 
 (Only **Unlock permanently** puts the item back next to the `.vkl`, because that's what it's for.)
 
 - Double-clicking a `.vkl` that is already open shows the open copy again instead of making a second one.
+- If you only looked at an item and didn't change it, closing it is instant: the private copy is removed
+  and the `.vkl` isn't rewritten (so a sync app has nothing to upload either).
+
+### Large files
+
+Locking, unlocking and opening read and write the whole item once, with a progress percentage shown.
+For multi-GB items the speed is set mostly by how fast your drive can write (budget SSDs slow down a
+lot on long writes; a 3 GB file takes about 40-50 s to lock on such a drive). Closing an unchanged item
+doesn't rewrite anything.
 - **Save As** and recent-file lists show the private folder's path while the item is open. That's expected.
 - If you locked something *after* your sync app had already uploaded it, the cloud still has the old,
   unlocked copy in its trash or version history. Delete it there (e.g. Google Drive → Trash).

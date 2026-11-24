@@ -104,14 +104,19 @@ namespace VaultKeep
 
             try
             {
-                using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+                Progress.Begin(isFolder ? FolderSize(full) : new FileInfo(full).Length);
+                using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, BufferSize))
+                using (var mac = new BackgroundHmac(macKey))
                 {
                     File.SetAttributes(temp, FileAttributes.Hidden);
-                    WriteHeader(fs, isFolder ? KindFolder : KindFile, keys.Slots, iv);
+                    // One pass: everything written (header + ciphertext) is hashed on a background thread as
+                    // it goes out, instead of reading the whole .vkl back afterwards (encrypt-then-MAC).
+                    var hashed = new HashingWriteStream(fs, mac);
+                    WriteHeader(hashed, isFolder ? KindFolder : KindFile, keys.Slots, iv);
 
                     using (var aes = CreateAes(encKey, iv))
                     using (var encryptor = aes.CreateEncryptor())
-                    using (var cs = new CryptoStream(fs, encryptor, CryptoStreamMode.Write, true))
+                    using (var cs = new CryptoStream(hashed, encryptor, CryptoStreamMode.Write, true))
                     using (var w = new BinaryWriter(cs, Encoding.UTF8, true))
                     {
                         byte[] buffer = new byte[BufferSize];
@@ -129,11 +134,8 @@ namespace VaultKeep
                         cs.FlushFinalBlock();
                     }
 
-                    // Encrypt-then-MAC: authenticate header + ciphertext.
-                    fs.Position = 0;
-                    byte[] mac = ComputeMac(fs, macKey, fs.Length);
-                    fs.Position = fs.Length;
-                    fs.Write(mac, 0, mac.Length);
+                    byte[] tag = mac.Finish();
+                    fs.Write(tag, 0, tag.Length);
                     fs.Flush(true);
                 }
 
@@ -163,14 +165,24 @@ namespace VaultKeep
             return result;
         }
 
+        private static long FolderSize(string dir)
+        {
+            long total = 0;
+            foreach (string f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                try { total += new FileInfo(f).Length; } catch { }
+            }
+            return total;
+        }
+
         private static void WriteFileBody(BinaryWriter w, string path, byte[] buffer)
         {
-            using (var src = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
+            using (var src = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan))
             {
                 w.Write(File.GetLastWriteTimeUtc(path).Ticks);
                 w.Write(src.Length);
                 w.Flush();
-                CopyExact(src, w.BaseStream, src.Length, buffer);
+                CopyExact(src, w.BaseStream, src.Length, buffer, true);
             }
         }
 
@@ -240,7 +252,7 @@ namespace VaultKeep
             string parent = restoreDir != null ? Path.GetFullPath(restoreDir) : Path.GetDirectoryName(full);
             var result = new UnlockResult();
 
-            using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
+            using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.SequentialScan))
             {
                 if (fs.Length < LegacyHeaderSize + IvSize + MacSize)
                     throw new InvalidDataException("This is not a valid VaultKeep file.");
@@ -279,35 +291,63 @@ namespace VaultKeep
                 try
                 {
                     long macOffset = fs.Length - MacSize;
-                    fs.Position = 0;
-                    byte[] expected = ComputeMac(fs, macKey, macOffset);
                     byte[] stored = new byte[MacSize];
                     fs.Position = macOffset;
                     ReadExact(fs, stored, MacSize);
-                    if (!FixedTimeEquals(expected, stored))
-                        throw new WrongPasswordException();
+                    byte[] header = new byte[cipherStart];
+                    fs.Position = 0;
+                    ReadExact(fs, header, (int)cipherStart);
 
-                    fs.Position = cipherStart;
-                    var cipher = new LimitedReadStream(fs, macOffset - cipherStart);
-                    using (var aes = CreateAes(encKey, iv))
-                    using (var decryptor = aes.CreateDecryptor())
-                    using (var cs = new CryptoStream(cipher, decryptor, CryptoStreamMode.Read))
-                    using (var r = new BinaryReader(cs, Encoding.UTF8))
+                    // One pass: decrypt into a temp name while the ciphertext is hashed on a background thread.
+                    // The temp is renamed to the real name only after the HMAC matches, so a tampered or damaged
+                    // file never produces a restored item (the temp is deleted instead).
+                    try
                     {
-                        string name = r.ReadString();
-                        ValidateName(name);
-                        string restored = Path.Combine(parent, name);
-                        if (File.Exists(restored) || Directory.Exists(restored))
-                            throw new IOException("\"" + name + "\" already exists in this folder. Move or rename it, then try again.");
+                        using (var mac = new BackgroundHmac(macKey))
+                        {
+                            mac.Add(header, 0, header.Length);
+                            fs.Position = cipherStart;
+                            Progress.Begin(macOffset - cipherStart);
+                            var cipher = new HashingReadStream(new LimitedReadStream(fs, macOffset - cipherStart), mac);
+                            using (var aes = CreateAes(encKey, iv))
+                            using (var decryptor = aes.CreateDecryptor())
+                            using (var cs = new CryptoStream(cipher, decryptor, CryptoStreamMode.Read))
+                            using (var r = new BinaryReader(cs, Encoding.UTF8))
+                            {
+                                Action verify = () =>
+                                {
+                                    DrainToEnd(cs); // the final block (padding) must be read and hashed too
+                                    if (!FixedTimeEquals(mac.Finish(), stored))
+                                        throw new WrongPasswordException();
+                                };
 
-                        byte[] buffer = new byte[BufferSize];
-                        if (kind == KindFile)
-                            RestoreFile(r, restored, buffer);
-                        else if (kind == KindFolder)
-                            RestoreFolder(r, parent, restored, buffer);
-                        else
-                            throw new InvalidDataException("Unknown item type in VaultKeep file.");
-                        result.Restored = restored;
+                                string name = r.ReadString();
+                                ValidateName(name);
+                                string restored = Path.Combine(parent, name);
+                                if (File.Exists(restored) || Directory.Exists(restored))
+                                    throw new IOException("\"" + name + "\" already exists in this folder. Move or rename it, then try again.");
+
+                                byte[] buffer = new byte[BufferSize];
+                                if (kind == KindFile)
+                                    RestoreFile(r, restored, buffer, verify);
+                                else if (kind == KindFolder)
+                                    RestoreFolder(r, parent, restored, buffer, verify);
+                                else
+                                    throw new InvalidDataException("Unknown item type in VaultKeep file.");
+                                result.Restored = restored;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // A damaged or tampered file can also fail half-way (bad padding, nonsense lengths).
+                        // Report that as "wrong password or damaged" rather than a confusing low-level error,
+                        // but keep real errors (disk full, name already exists) when the file itself is intact.
+                        if (ex is WrongPasswordException) throw;
+                        fs.Position = 0;
+                        if (!FixedTimeEquals(ComputeMac(fs, macKey, macOffset), stored))
+                            throw new WrongPasswordException();
+                        throw;
                     }
                 }
                 finally
@@ -321,13 +361,16 @@ namespace VaultKeep
             return result;
         }
 
-        private static void RestoreFile(BinaryReader r, string target, byte[] buffer)
+        private static void RestoreFile(BinaryReader r, string target, byte[] buffer, Action verify)
         {
             string temp = target + ".vkpart";
             TryDeleteFile(temp);
             try
             {
                 ExtractFileBody(r, temp, buffer);
+                File.SetAttributes(temp, FileAttributes.Hidden);
+                verify();
+                File.SetAttributes(temp, FileAttributes.Normal);
                 File.Move(temp, target);
             }
             catch
@@ -337,7 +380,7 @@ namespace VaultKeep
             }
         }
 
-        private static void RestoreFolder(BinaryReader r, string parent, string target, byte[] buffer)
+        private static void RestoreFolder(BinaryReader r, string parent, string target, byte[] buffer, Action verify)
         {
             // Extract into a hidden temp folder first so a failure never leaves a half-restored folder.
             string temp = Path.Combine(parent, "." + Path.GetFileName(target) + ".vkpart-" + Guid.NewGuid().ToString("N").Substring(0, 8));
@@ -362,6 +405,7 @@ namespace VaultKeep
                     else
                         throw new InvalidDataException("Corrupt VaultKeep file.");
                 }
+                verify();
                 Directory.Move(temp, target);
                 new DirectoryInfo(target).Attributes &= ~FileAttributes.Hidden;
             }
@@ -377,7 +421,7 @@ namespace VaultKeep
             long ticks = r.ReadInt64();
             long length = r.ReadInt64();
             if (length < 0) throw new InvalidDataException("Corrupt VaultKeep file.");
-            using (var outFs = new FileStream(dest, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var outFs = new FileStream(dest, FileMode.CreateNew, FileAccess.Write, FileShare.None, BufferSize))
                 CopyExact(r.BaseStream, outFs, length, buffer);
             try { File.SetLastWriteTimeUtc(dest, new DateTime(ticks, DateTimeKind.Utc)); } catch { }
         }
@@ -550,6 +594,11 @@ namespace VaultKeep
 
         private static void CopyExact(Stream src, Stream dst, long count, byte[] buffer)
         {
+            CopyExact(src, dst, count, buffer, false);
+        }
+
+        private static void CopyExact(Stream src, Stream dst, long count, byte[] buffer, bool reportProgress)
+        {
             long remaining = count;
             while (remaining > 0)
             {
@@ -557,7 +606,14 @@ namespace VaultKeep
                 if (n <= 0) throw new EndOfStreamException("The file changed or was truncated while being processed.");
                 dst.Write(buffer, 0, n);
                 remaining -= n;
+                if (reportProgress) Progress.Add(n);
             }
+        }
+
+        private static void DrainToEnd(Stream s)
+        {
+            byte[] tmp = new byte[4096];
+            while (s.Read(tmp, 0, tmp.Length) > 0) { }
         }
 
         private static void ReadExact(Stream s, byte[] buffer, int count)

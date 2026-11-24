@@ -118,6 +118,33 @@ $p = Start-OpenSession "$file.vkl" $pw
 $copy = Get-OpenCopy $p
 Check (Wait-Until { -not (Test-Path $copy) -and $p.HasExited } 30) 're-locks by itself when nothing opens it'
 
+Write-Host 'Opened but not changed: the .vkl is not rewritten'
+function Get-VklState([string]$vkl) { (Get-FileHash $vkl).Hash + '|' + (Get-Item $vkl).LastWriteTimeUtc.Ticks }
+$before = Get-VklState "$file.vkl"
+$p = Start-OpenSession "$file.vkl" $pw
+$copy = Get-OpenCopy $p
+Check (Wait-Until { -not (Test-Path $copy) -and $p.HasExited } 30) 'unchanged file: open copy removed on close'
+Check ((Get-VklState "$file.vkl") -eq $before) 'unchanged file: .vkl left exactly as it was (not re-encrypted)'
+Check ((Get-WorkspaceSessions).Count -eq 0) 'unchanged file: nothing left in the private folder'
+
+$before = Get-VklState "$folder.vkl"
+$p = Start-OpenSession "$folder.vkl" $pw
+$copy = Get-OpenCopy $p
+Check (Wait-Until { -not (Test-Path $copy) -and $p.HasExited } 30) 'unchanged folder: open copy removed on close'
+Check ((Get-VklState "$folder.vkl") -eq $before) 'unchanged folder: .vkl left exactly as it was'
+
+Write-Host 'Edits that keep the same size are still saved'
+$p = Start-OpenSession "$file.vkl" $pw
+$copy = Get-OpenCopy $p
+$text = Get-Content $copy -Raw
+$same = ($text.ToCharArray() | ForEach-Object { if ($_ -eq 'd') { 'D' } else { $_ } }) -join ''
+[IO.File]::WriteAllText($copy, $same)
+Check ((Get-Item $copy).Length -eq [Text.Encoding]::UTF8.GetByteCount($text)) 'edit keeps the same size'
+$null = Wait-Until { -not (Test-Path $copy) -and $p.HasExited } 30
+$r = Invoke-VaultKeep unlock "$file.vkl" $pw
+Check ($r.Code -eq 0 -and (Get-Content $file -Raw) -ceq $same) 'same-size edit was saved into the .vkl'
+$null = Invoke-VaultKeep lock $file $pw
+
 Write-Host 'Opening the same .vkl twice'
 $p = Start-OpenSession "$file.vkl" $pw 0
 $copy = Get-OpenCopy $p

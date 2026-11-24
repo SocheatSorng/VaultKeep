@@ -69,6 +69,38 @@ namespace VaultKeep
             catch { }
         }
 
+        /// <summary>
+        /// Fingerprint of an opened item: every file's relative path, size and last-write time, plus every
+        /// folder. If it's the same when the item is closed, nothing was changed and the .vkl doesn't need
+        /// rewriting (the same signals sync apps use to detect changes).
+        /// </summary>
+        public static string Snapshot(string itemPath)
+        {
+            var sb = new System.Text.StringBuilder();
+            string full = Path.GetFullPath(itemPath).TrimEnd('\\');
+            if (File.Exists(full))
+            {
+                var fi = new FileInfo(full);
+                sb.Append("F|").Append(fi.Length).Append('|').Append(fi.LastWriteTimeUtc.Ticks);
+                return sb.ToString();
+            }
+            if (!Directory.Exists(full)) return null;
+            var entries = new System.Collections.Generic.List<string>();
+            foreach (string e in Directory.EnumerateFileSystemEntries(full, "*", SearchOption.AllDirectories))
+            {
+                string rel = e.Substring(full.Length + 1).ToLowerInvariant();
+                if (Directory.Exists(e)) entries.Add("D|" + rel);
+                else
+                {
+                    var fi = new FileInfo(e);
+                    entries.Add("F|" + rel + "|" + fi.Length + "|" + fi.LastWriteTimeUtc.Ticks);
+                }
+            }
+            entries.Sort(StringComparer.Ordinal);
+            foreach (string e in entries) sb.Append(e).Append('\n');
+            return sb.ToString();
+        }
+
         private static void DeleteTree(string dir)
         {
             foreach (string entry in Directory.GetFileSystemEntries(dir))

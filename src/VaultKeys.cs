@@ -70,15 +70,18 @@ namespace VaultKeep
         /// Makes the USB-key slots match the keys registered on this PC: adds missing ones, and drops slots of
         /// keys that were removed here (e.g. a lost drive). The password slot is always kept.
         /// </summary>
-        public void SyncKeySlots(IEnumerable<RegisteredKey> keys)
+        /// <returns>True if any slot was added or removed (the .vkl then needs rewriting).</returns>
+        public bool SyncKeySlots(IEnumerable<RegisteredKey> keys)
         {
             var wanted = new List<RegisteredKey>(keys ?? new RegisteredKey[0]);
-            _slots.RemoveAll(s => s[0] == SlotUsbKey && !wanted.Exists(k => KeyStore.BytesEqual(k.Id, SlotKeyId(s))));
+            int removed = _slots.RemoveAll(s => s[0] == SlotUsbKey && !wanted.Exists(k => KeyStore.BytesEqual(k.Id, SlotKeyId(s))));
+            int added = 0;
             foreach (RegisteredKey k in wanted)
             {
                 bool present = _slots.Exists(s => s[0] == SlotUsbKey && KeyStore.BytesEqual(k.Id, SlotKeyId(s)));
-                if (!present) _slots.Add(MakeKeySlot(_dek, k));
+                if (!present) { _slots.Add(MakeKeySlot(_dek, k)); added++; }
             }
+            return removed + added > 0;
         }
 
         public void Clear()

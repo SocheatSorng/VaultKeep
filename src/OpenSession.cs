@@ -41,6 +41,9 @@ namespace VaultKeep
         private readonly DateTime _started = DateTime.UtcNow;
         private readonly Control _ui = new Control(); // marshals background results back to the UI thread
         private string _record;
+        private readonly string _snapshot;  // fingerprint when opened, to skip re-locking an unchanged item
+        private bool _unchanged;
+        private string _pendingDiscard;
         private int _freeChecks;
         private bool _locking;
         private bool _guarding;
@@ -57,6 +60,7 @@ namespace VaultKeep
             _isFolder = Directory.Exists(_path);
             _guardSeconds = guardSeconds;
             _detector = new InUseDetector(_path, _isFolder);
+            _snapshot = SafeSnapshot();
             _record = Recovery.Add(_path, _vklPath);
             _ui.CreateControl();
             IntPtr forceHandle = _ui.Handle;
@@ -148,6 +152,7 @@ namespace VaultKeep
         /// <summary>After re-locking: watch for a late Save recreating the copy.</summary>
         private void GuardTick()
         {
+            TryFinishDiscard();
             if (DateTime.UtcNow > _guardUntil) { Exit(); return; }
 
             bool fileBack = File.Exists(_path);
@@ -194,10 +199,33 @@ namespace VaultKeep
 
             var t = new Thread(() =>
             {
+                // Big items take a while: show how far along re-locking is in the tray icon's tooltip.
+                string label = Trim("VaultKeep: locking " + _name);
+                Progress.Hook = percent =>
+                {
+                    if (!_finished && !lateSave)
+                        _ui.BeginInvoke(new Action(() => _tray.Text = Trim(label + "... " + percent + "%")));
+                };
                 LockResult result = null;
                 Exception error = null;
-                // Written to a temp file and swapped in, so the .vkl is replaced only by a complete new version.
-                try { result = VaultCrypto.Lock(_path, CurrentKeys(), true, _vklPath); }
+                try
+                {
+                    bool keysChanged;
+                    VaultKeys keys = CurrentKeys(out keysChanged);
+                    if (!lateSave && !keysChanged && File.Exists(_vklPath) && _snapshot != null && _snapshot == SafeSnapshot())
+                    {
+                        // Opened but not changed: the .vkl already holds exactly this content, so don't spend
+                        // minutes re-encrypting and rewriting a large item. Just remove the private copy.
+                        DiscardUnchangedCopy();
+                        result = new LockResult { OutputPath = _vklPath };
+                        _unchanged = true;
+                    }
+                    else
+                    {
+                        // Written to a temp file and swapped in, so the .vkl is replaced only by a complete new version.
+                        result = VaultCrypto.Lock(_path, keys, true, _vklPath);
+                    }
+                }
                 catch (Exception ex) { error = ex; }
                 if (_finished) return;
                 _ui.BeginInvoke(new Action(() => OnRelocked(result, error, lateSave)));
@@ -229,6 +257,8 @@ namespace VaultKeep
             }
             else if (lateSave)
                 message = "A program saved \"" + _name + "\" again after it was locked. The new version is locked too.";
+            else if (_unchanged)
+                message = "\"" + _name + "\" is locked again (nothing was changed).";
             else
                 message = "\"" + _name + "\" is locked again.";
             EnterGuard(message, icon);
@@ -274,9 +304,57 @@ namespace VaultKeep
         /// <summary>The item's keys, with USB-key slots updated to the keys registered on this PC right now.</summary>
         private VaultKeys CurrentKeys()
         {
-            try { _keys.SyncKeySlots(KeyStore.LoadRegistered()); }
+            bool changed;
+            return CurrentKeys(out changed);
+        }
+
+        private VaultKeys CurrentKeys(out bool changed)
+        {
+            changed = false;
+            try { changed = _keys.SyncKeySlots(KeyStore.LoadRegistered()); }
             catch { } // key list unreadable: keep the slots the item already had
             return _keys;
+        }
+
+        private string SafeSnapshot()
+        {
+            try { return Workspace.Snapshot(_path); }
+            catch { return null; } // can't tell: treat as changed and re-lock normally
+        }
+
+        /// <summary>
+        /// Removes an unchanged open copy. It is first renamed out of the way in one step (fails cleanly if a
+        /// program still holds it), so a half-finished delete can never be mistaken for an edited item and
+        /// locked over the complete .vkl. If the delete itself fails, it's retried on later ticks.
+        /// </summary>
+        private void DiscardUnchangedCopy()
+        {
+            string discard = Path.Combine(_sessionDir, ".discard-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            if (_isFolder) Directory.Move(_path, discard);
+            else File.Move(_path, discard);
+            _pendingDiscard = discard;
+            TryFinishDiscard();
+        }
+
+        private void TryFinishDiscard()
+        {
+            string p = _pendingDiscard;
+            if (p == null) return;
+            try
+            {
+                if (Directory.Exists(p))
+                {
+                    foreach (string f in Directory.GetFiles(p, "*", SearchOption.AllDirectories)) File.SetAttributes(f, FileAttributes.Normal);
+                    Directory.Delete(p, true);
+                }
+                else if (File.Exists(p))
+                {
+                    File.SetAttributes(p, FileAttributes.Normal);
+                    File.Delete(p);
+                }
+                _pendingDiscard = null;
+            }
+            catch { } // still in use somewhere: try again later
         }
 
         private void Notify(string message, ToolTipIcon icon)
@@ -300,6 +378,7 @@ namespace VaultKeep
             _finished = true;
             _timer.Stop();
             if (_navTimer != null) _navTimer.Stop();
+            TryFinishDiscard();
             Recovery.Remove(_record);
             Workspace.RemoveIfEmpty(_sessionDir);
             SystemEvents.SessionEnding -= OnSessionEnding;

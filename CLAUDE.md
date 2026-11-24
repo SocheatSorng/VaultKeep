@@ -29,6 +29,9 @@ After every code change: run lint, build and the tests (full suite if `OpenSessi
   Script mode stdin for open/unlock: line 1 = item password, line 2 = key PIN.
 - `src/MainForm.cs`: window shown when the exe runs without arguments: right-click menu + key management.
 - `src/Pbkdf2.cs`: PBKDF2 via native CNG (`BCryptDeriveKeyPBKDF2`), managed fallback.
+- `src/Streaming.cs`: one-pass lock/unlock: HMAC on a background thread (`BackgroundHmac`, pooled 1 MB
+  buffers), hashing read/write streams, `Progress` (thread-static percent hook). Unlock decrypts to a temp
+  name and renames only after the HMAC matches; keep that order.
 - `src/Workspace.cs`: private folder for opened items (`<DataDir>\workspace\<session>\<item>`); every delete
   there goes through `IsSessionDir` (allowlisted root, exactly one level below, name pattern, no links).
 - `src/OpenSession.cs`: tray-icon session that watches an opened item (in the workspace) and re-locks it

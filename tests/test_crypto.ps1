@@ -87,6 +87,39 @@ Check ($r.Code -eq 4 -and -not (Test-Path $file)) 'modified .vkl rejected, nothi
 $r = Invoke-VaultKeep unlock "$t\junk.vkl" $pw
 Check ($r.Code -eq 1) 'non-VaultKeep file rejected'
 
+Write-Host 'Tamper detection during one-pass unlock (content is decrypted before the check finishes)'
+function Test-Tamper([string]$what, [string]$item, [scriptblock]$damage) {
+    $null = Invoke-VaultKeep lock $item $pw
+    & $damage "$item.vkl"
+    $r = Invoke-VaultKeep unlock "$item.vkl" $pw
+    $leftovers = @(Get-ChildItem (Split-Path $item) -Force | Where-Object { $_.Name -like '*.vkpart*' })
+    Check ($r.Code -eq 4 -and -not (Test-Path $item) -and $leftovers.Count -eq 0 -and (Test-Path "$item.vkl")) "$what : rejected, nothing restored, no temp left"
+    Remove-Item "$item.vkl" -Force
+}
+function Flip([string]$path, [long]$offset) {
+    $fs = [IO.File]::Open($path, 'Open', 'ReadWrite'); try {
+        $fs.Position = $offset; $b = $fs.ReadByte(); $fs.Position = $offset; $fs.WriteByte($b -bxor 0x40)
+    } finally { $fs.Close() }
+}
+$bigData = New-Object byte[] (5MB); (New-Object Random 7).NextBytes($bigData)
+$big = Join-Path $t 'video.mp4'
+[IO.File]::WriteAllBytes($big, $bigData)
+Test-Tamper 'byte changed in the middle of the content' $big { param($v) Flip $v ((Get-Item $v).Length / 2) }
+[IO.File]::WriteAllBytes($big, $bigData)
+Test-Tamper 'last encrypted block changed' $big { param($v) Flip $v ((Get-Item $v).Length - 33) }
+[IO.File]::WriteAllBytes($big, $bigData)
+Test-Tamper 'stored check value changed' $big { param($v) Flip $v ((Get-Item $v).Length - 1) }
+[IO.File]::WriteAllBytes($big, $bigData)
+Test-Tamper 'file cut short' $big { param($v) $fs = [IO.File]::Open($v, 'Open', 'ReadWrite'); $fs.SetLength($fs.Length - 1MB); $fs.Close() }
+$tf = Join-Path $t 'Tampered folder'; New-Item -ItemType Directory "$tf\sub" -Force | Out-Null
+[IO.File]::WriteAllBytes("$tf\sub\a.bin", $bigData); Set-Content "$tf\b.txt" 'b'
+$null = Invoke-VaultKeep lock $tf $pw
+Flip "$tf.vkl" ((Get-Item "$tf.vkl").Length / 2)
+$r = Invoke-VaultKeep unlock "$tf.vkl" $pw
+$leftovers = @(Get-ChildItem $t -Force | Where-Object { $_.Name -like '*.vkpart*' })
+Check ($r.Code -eq 4 -and -not (Test-Path $tf) -and $leftovers.Count -eq 0) 'folder with changed content: rejected, no folder restored, no temp folder left'
+Remove-Item "$tf.vkl" -Force
+
 Write-Host 'Safety checks'
 Set-Content "$t\dup.txt" 'a'; $null = Invoke-VaultKeep lock "$t\dup.txt" $pw; Set-Content "$t\dup.txt" 'b'
 $r = Invoke-VaultKeep unlock "$t\dup.txt.vkl" $pw

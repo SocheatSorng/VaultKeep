@@ -297,15 +297,30 @@ namespace VaultKeep
             ClientSize = new Size(340, 90);
             Icon = Shell.AppIcon;
 
-            Controls.Add(new Label { Text = message, AutoEllipsis = true, Location = new Point(14, 14), Size = new Size(312, 22) });
-            Controls.Add(new ProgressBar { Style = ProgressBarStyle.Marquee, Location = new Point(14, 46), Size = new Size(312, 20) });
+            var label = new Label { Text = message, AutoEllipsis = true, Location = new Point(14, 14), Size = new Size(312, 22) };
+            var bar = new ProgressBar { Style = ProgressBarStyle.Marquee, Location = new Point(14, 46), Size = new Size(312, 20) };
+            Controls.Add(label);
+            Controls.Add(bar);
+
+            // Large items report how far along they are: switch from the spinner to a real percentage.
+            Action<int> showPercent = percent =>
+            {
+                if (bar.Style != ProgressBarStyle.Continuous) bar.Style = ProgressBarStyle.Continuous;
+                bar.Value = Math.Max(0, Math.Min(100, percent));
+                label.Text = message + "  " + percent + "%";
+            };
 
             Shown += delegate
             {
                 var t = new Thread(() =>
                 {
+                    Progress.Hook = percent =>
+                    {
+                        if (percent > 0 && IsHandleCreated) BeginInvoke(showPercent, percent);
+                    };
                     try { _work(); }
                     catch (Exception ex) { _error = ex; }
+                    finally { Progress.Hook = null; }
                     BeginInvoke(new Action(Close));
                 });
                 t.IsBackground = true;
