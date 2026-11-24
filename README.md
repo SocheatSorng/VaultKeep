@@ -9,6 +9,19 @@ Password-protect any file or folder from the Windows Explorer right-click menu.
   locks it again automatically**, edits included. So the password is needed every time.
 - **Right-click a `.vkl` file → Unlock permanently** removes the protection for good.
 
+### Safe with Google Drive, OneDrive, Dropbox and shared folders
+
+When you open a locked item, the unlocked copy is **not** put next to the `.vkl`. It is opened from
+VaultKeep's private folder on this PC (`%LOCALAPPDATA%\VaultKeep\workspace`), which is never synced.
+The `.vkl` stays where it is the whole time. When you close the item, your edits are written back into
+the `.vkl` and the private copy is removed. So a sync app only ever uploads the encrypted `.vkl`.
+(Only **Unlock permanently** puts the item back next to the `.vkl`, because that's what it's for.)
+
+- Double-clicking a `.vkl` that is already open shows the open copy again instead of making a second one.
+- **Save As** and recent-file lists show the private folder's path while the item is open. That's expected.
+- If you locked something *after* your sync app had already uploaded it, the cloud still has the old,
+  unlocked copy in its trash or version history. Delete it there (e.g. Google Drive → Trash).
+
 ### Security key (USB flash drive)
 
 A USB flash drive can be a key: **with it plugged in, double-clicking a `.vkl` opens it without typing
@@ -17,6 +30,8 @@ the password.** Without the drive, the password still works, so losing the drive
 - **Set up:** right-click the USB drive in File Explorer → **Make VaultKeep security key**, or run
   `VaultKeep.exe` → **Add USB key...**. The key is saved in a hidden `.vaultkeep` folder on the drive;
   your other files there are not touched. Set up a second drive as a backup if you like.
+  **Adding a key asks for your Windows password** (Windows' own sign-in prompt; a PIN or fingerprint
+  can't be checked here), so someone using your PC while you're away can't add their own drive.
 - Everything you lock afterwards opens with the key. Items locked earlier get the key the next time you
   open them with the password (they're re-locked with it).
 - The password prompt notices when you plug in the key while it's open.
@@ -25,6 +40,16 @@ the password.** Without the drive, the password still works, so losing the drive
 - Using the same drive on another PC: on that PC, choose **Add USB key...** with the drive plugged in. VaultKeep
   sees the existing key and offers to use it there too.
 - Anyone holding the drive can open your locked items, so keep it safe like a house key.
+
+**Can someone else's USB drive open my items?** No:
+
+- A key made on another PC (or another Windows account) has no slot in your items, so it opens nothing.
+- Copying your key's ID into a fake key doesn't help. Opening needs your drive's private key, and the
+  password still works even with a fake key plugged in.
+- Adding a key slot to a `.vkl` by editing it is detected (the whole file is authenticated).
+- Registering a new key on your PC needs your Windows password, and the real app has no silent way to do it.
+- What VaultKeep can't stop: someone with *your drive* (keep it safe), or someone who can run their own
+  programs while signed in as you (lock your PC with Win+L when you step away).
 
 How it works: the drive holds the private half of an RSA-3072 key pair. The PC keeps only the public half
 (in `%LOCALAPPDATA%\VaultKeep\keys.dat`, DPAPI-encrypted), so items can be locked for the key while the
@@ -50,7 +75,7 @@ If a *folder* reappears, VaultKeep warns you instead of merging it, so no files 
 ## Build, lint and test
 
 ```powershell
-.\build.ps1            # -> bin\VaultKeep.exe
+.\build.ps1            # -> bin\VaultKeep.exe (the app) + bin\test\VaultKeep.exe (test build, never install it)
 .\lint.ps1             # warnings as errors + formatting checks
 .\test.ps1 -Headless   # lock/unlock round trips, wrong password, tampering, safety checks
 .\test.ps1             # also the open/auto-relock tests (briefly opens Notepad and File Explorer)

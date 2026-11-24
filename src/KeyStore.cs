@@ -6,15 +6,20 @@ using System.Text;
 
 namespace VaultKeep
 {
-    /// <summary>Where VaultKeep keeps its per-user data. VAULTKEEP_HOME overrides it (tests).</summary>
+    /// <summary>
+    /// Where VaultKeep keeps its per-user data. Only the test build (TESTHOOKS) lets VAULTKEEP_HOME redirect it:
+    /// in the real app, an environment variable must not be able to swap in someone else's key list.
+    /// </summary>
     internal static class AppPaths
     {
         public static string DataDir
         {
             get
             {
+#if TESTHOOKS
                 string over = Environment.GetEnvironmentVariable("VAULTKEEP_HOME");
                 if (!string.IsNullOrEmpty(over)) return over;
+#endif
                 return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VaultKeep");
             }
         }

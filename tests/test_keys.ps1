@@ -53,6 +53,33 @@ Check ($r.Code -eq 4 -and (Test-Path "$file.vkl")) 'key not plugged in: wrong pa
 $r = Invoke-VaultKeep unlock "$file.vkl" $pw
 Check ($r.Code -eq 0 -and $r.Out -match "`tpassword") 'key not plugged in: password works'
 
+Write-Host "Someone else's USB drive can't open your items"
+$null = Invoke-VaultKeep lock $file $pw
+# Another person makes a VaultKeep key with their own copy of VaultKeep (their own key list).
+$theirHome = Join-Path $t 'their-pc'; $theirUsb = Join-Path $t 'their-usb'
+New-Item -ItemType Directory $theirHome, $theirUsb | Out-Null
+$env:VAULTKEEP_HOME = $theirHome
+$null = Invoke-VaultKeep key-create $theirUsb $null @('--label', 'Not yours')
+$env:VAULTKEEP_HOME = $script:VkHome
+$r = Invoke-VaultKeep unlock "$file.vkl" $bad @('--key-dir', $theirUsb)
+Check ($r.Code -eq 4 -and (Test-Path "$file.vkl") -and -not (Test-Path $file)) 'a key made elsewhere cannot open it'
+# They copy your key's ID (visible in the .vkl) into their key file to impersonate your key.
+$forged = Join-Path $t 'forged-usb'; New-Item -ItemType Directory "$forged\.vaultkeep" -Force | Out-Null
+$theirKey = [IO.File]::ReadAllBytes((Join-Path $theirUsb '.vaultkeep\vaultkeep.vkkey'))
+$yourKey = [IO.File]::ReadAllBytes($keyFile)
+[Array]::Copy($yourKey, 6, $theirKey, 6, 16)   # magic(6) | key id(16) | ...
+[IO.File]::WriteAllBytes("$forged\.vaultkeep\vaultkeep.vkkey", $theirKey)
+$r = Invoke-VaultKeep unlock "$file.vkl" $bad @('--key-dir', $forged)
+Check ($r.Code -eq 4 -and (Test-Path "$file.vkl") -and -not (Test-Path $file)) 'a forged key with your key ID cannot open it'
+$r = Invoke-VaultKeep unlock "$file.vkl" $pw @('--key-dir', $forged)
+Check ($r.Code -eq 0 -and $r.Out -match "`tpassword") 'with a forged key plugged in, your password still works'
+# The real app has no silent way to add a key: it needs Windows sign-in (the window / right-click).
+$sneaky = Join-Path $t 'sneaky-usb'; New-Item -ItemType Directory $sneaky | Out-Null
+$p = Start-Process $script:RealExe -ArgumentList 'key-create', "`"$sneaky`"", '--quiet' -PassThru -NoNewWindow `
+    -RedirectStandardOutput (Join-Path $script:Out 'real.out') -RedirectStandardError (Join-Path $script:Out 'real.err')
+$null = $p.Handle; $p.WaitForExit()
+Check ($p.ExitCode -eq 1 -and -not (Test-Path (Join-Path $sneaky '.vaultkeep'))) 'real app refuses to add a key without Windows sign-in'
+
 Write-Host 'Two keys (main + backup)'
 $r = Invoke-VaultKeep key-create $usb2 $null @('--label', 'Backup USB')
 $id2 = $r.Out.Trim()
@@ -64,9 +91,10 @@ Check ($r.Code -eq 0) 'backup key opens it on its own'
 Write-Host 'Opened with a key, re-locked: password and keys still work'
 $null = Invoke-VaultKeep lock $file $pw
 $p = Start-OpenSession "$file.vkl" $bad 0 @('--key-dir', $usb1)
-Check (Wait-Until { Test-Path $file } 15) 'open with key restores the item'
-Add-Content $file 'edited'
-Check (Wait-Until { (Test-Path "$file.vkl") -and -not (Test-Path $file) -and $p.HasExited } 40) 're-locked after use'
+$copy = Get-OpenCopy $p
+Check ($null -ne $copy -and (Test-Path $copy)) 'open with key restores the item (in the private workspace)'
+Add-Content $copy 'edited'
+Check (Wait-Until { (Test-Path "$file.vkl") -and -not (Test-Path $copy) -and $p.HasExited } 40) 're-locked after use'
 $r = Invoke-VaultKeep unlock "$file.vkl" $pw
 Check ($r.Code -eq 0 -and (Get-Content $file -Raw) -match 'edited') 'password still opens it after a key-only session'
 $null = Invoke-VaultKeep lock $file $pw
@@ -80,7 +108,7 @@ Check ((Get-SlotCount "$other.vkl") -eq 2) 'items locked after removal have no s
 $r = Invoke-VaultKeep unlock "$other.vkl" $bad @('--key-dir', $usb1)
 Check ($r.Code -eq 4) 'removed key cannot open new items'
 $p = Start-OpenSession "$file.vkl" $pw 0
-$null = Wait-Until { Test-Path $file } 15
+$null = Get-OpenCopy $p
 Check (Wait-Until { (Test-Path "$file.vkl") -and $p.HasExited } 40) 'older item re-locked after opening'
 Check ((Get-SlotCount "$file.vkl") -eq 2) 're-lock dropped the removed key slot'
 $r = Invoke-VaultKeep unlock "$file.vkl" $bad @('--key-dir', $usb1)
@@ -94,7 +122,7 @@ Check ((Get-SlotCount "$t\plain.txt.vkl") -eq 1) 'locked with no keys: password 
 $usb3 = Join-Path $t 'usb3'; New-Item -ItemType Directory $usb3 | Out-Null
 $null = Invoke-VaultKeep key-create $usb3 $null
 $p = Start-OpenSession "$t\plain.txt.vkl" $pw 0
-$null = Wait-Until { Test-Path "$t\plain.txt" } 15
+$null = Get-OpenCopy $p
 $null = Wait-Until { (Test-Path "$t\plain.txt.vkl") -and $p.HasExited } 40
 $r = Invoke-VaultKeep unlock "$t\plain.txt.vkl" $bad @('--key-dir', $usb3)
 Check ($r.Code -eq 0) 'item locked before the key existed opens with it after one use'

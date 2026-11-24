@@ -107,11 +107,12 @@ namespace VaultKeep
                 Info("\"" + name + "\" is already locked.");
                 return 0;
             }
-            return LockWithPrompt(path, false) ? 0 : 2;
+            return LockWithPrompt(path, false, null) ? 0 : 2;
         }
 
         /// <summary>Asks for a new password and locks the item. Returns false if the user cancelled.</summary>
-        internal static bool LockWithPrompt(string path, bool replaceStale)
+        /// <param name="outputPath">The .vkl to write (null: next to the item).</param>
+        internal static bool LockWithPrompt(string path, bool replaceStale, string outputPath)
         {
             string name = Path.GetFileName(Path.GetFullPath(path).TrimEnd('\\'));
             List<RegisteredKey> registered = RegisteredKeysOrEmpty();
@@ -130,7 +131,7 @@ namespace VaultKeep
             ProgressForm.Run("Locking " + name + "...", delegate
             {
                 VaultKeys keys = VaultKeys.CreateNew(password, registered);
-                try { result = VaultCrypto.Lock(path, keys, replaceStale); }
+                try { result = VaultCrypto.Lock(path, keys, replaceStale, outputPath); }
                 finally { keys.Clear(); }
             });
 
@@ -144,31 +145,54 @@ namespace VaultKeep
             return true;
         }
 
-        /// <summary>Default double-click action: unlock for use, open it, re-lock when it's closed.</summary>
+        /// <summary>
+        /// Default double-click action: decrypt into VaultKeep's private workspace (the .vkl stays where it is,
+        /// so sync apps never see an unlocked copy), open it, and write it back into the .vkl once it's closed.
+        /// </summary>
         private static int OpenInteractive(string path)
         {
+            string openCopy = Recovery.FindOpenCopy(path);
+            if (openCopy != null)
+            {
+                // Already open: show the same copy again rather than making a second one whose
+                // re-lock could overwrite the first one's edits.
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(openCopy) { UseShellExecute = true });
+                return 0;
+            }
+
+            string sessionDir = Workspace.CreateSessionDir();
             VaultKeys keys;
-            string restored = PromptAndUnlock(path, "Opening", out keys);
-            if (restored == null) return 2;
-            Application.Run(new OpenSession(restored, keys, true, OpenSession.DefaultGuardSeconds));
+            string restored;
+            try { restored = PromptAndUnlock(path, "Opening", out keys, sessionDir, false); }
+            catch { Workspace.DeleteSessionDir(sessionDir); throw; }
+            if (restored == null) { Workspace.DeleteSessionDir(sessionDir); return 2; }
+            Application.Run(new OpenSession(restored, path, keys, true, OpenSession.DefaultGuardSeconds));
             return 0;
         }
 
-        /// <summary>"Unlock permanently": restore the original and stop protecting it.</summary>
+        /// <summary>"Unlock permanently": restore the original next to the .vkl and stop protecting it.</summary>
         private static int UnlockInteractive(string path)
         {
+            if (Recovery.FindOpenCopy(path) != null)
+            {
+                Info("\"" + Path.GetFileName(path) + "\" is open right now. Close it first; once it has locked again, " +
+                     "you can unlock it permanently.");
+                return 2;
+            }
             VaultKeys keys;
-            string restored = PromptAndUnlock(path, "Unlocking", out keys);
+            string restored = PromptAndUnlock(path, "Unlocking", out keys, null, true);
             if (keys != null) keys.Clear();
             return restored != null ? 0 : 2;
         }
 
         /// <summary>
         /// Opens the item with a plugged-in security key if one fits; otherwise asks for the password
-        /// (the dialog also notices a key being plugged in while it's open). Restores the item in place.
+        /// (the dialog also notices a key being plugged in while it's open).
         /// </summary>
+        /// <param name="restoreDir">Where to restore (null: next to the .vkl).</param>
+        /// <param name="deleteVkl">Delete the .vkl afterwards (permanent unlock only).</param>
         /// <returns>Path of the restored item, or null if the user cancelled.</returns>
-        private static string PromptAndUnlock(string path, string verb, out VaultKeys keys)
+        private static string PromptAndUnlock(string path, string verb, out VaultKeys keys, string restoreDir, bool deleteVkl)
         {
             keys = null;
             string name = Path.GetFileName(path);
@@ -180,29 +204,37 @@ namespace VaultKeep
 
             string error = null;
             bool showKeyHint = RegisteredKeysOrEmpty().Count > 0;
+            var failedKeys = new List<string>();
+            Func<List<KeyFile>> usableKeys = () => FindKeys().FindAll(k => !failedKeys.Contains(k.IdHex + "|" + k.Path));
             while (true)
             {
-                KeyFile key = VaultCrypto.FindKeyFor(path, FindKeys());
+                KeyFile key = VaultCrypto.FindKeyFor(path, usableKeys());
                 if (key != null)
                 {
                     try
                     {
                         UnlockResult r = null;
                         ProgressForm.Run(verb + " " + name + " with security key \"" + key.Label + "\"...",
-                            delegate { r = VaultCrypto.Unlock(path, null, new[] { key }); });
+                            delegate { r = VaultCrypto.Unlock(path, null, new[] { key }, restoreDir, deleteVkl); });
                         keys = r.Keys;
                         return r.Restored;
                     }
-                    catch (WrongPasswordException)
+                    catch (Exception ex)
                     {
-                        error = "The security key didn't open it (the file may be damaged). Try the password.";
+                        // A key with a matching ID that doesn't work (damaged, or a fake copying the ID) must
+                        // never stop the owner from using the password.
+                        if (!(ex is WrongPasswordException) && !(ex is NeedPasswordException)) throw;
+                        error = "The security key \"" + key.Label + "\" didn't open it. Use the password.";
+                        showKeyHint = false;
+                        failedKeys.Add(key.IdHex + "|" + key.Path);
                     }
                 }
 
                 string pwd;
+                // Watch for a (not yet tried) key being plugged in while the dialog is open.
                 using (var f = new PasswordForm(false, name, error,
                     showKeyHint ? "Or plug in your VaultKeep security key." : null,
-                    () => VaultCrypto.FindKeyFor(path, FindKeys()) != null))
+                    () => VaultCrypto.FindKeyFor(path, usableKeys()) != null))
                 {
                     DialogResult answer = f.ShowDialog();
                     if (answer == DialogResult.Yes) { error = null; continue; } // a key was plugged in
@@ -212,7 +244,7 @@ namespace VaultKeep
                 try
                 {
                     UnlockResult r = null;
-                    ProgressForm.Run(verb + " " + name + "...", delegate { r = VaultCrypto.Unlock(path, pwd, null); });
+                    ProgressForm.Run(verb + " " + name + "...", delegate { r = VaultCrypto.Unlock(path, pwd, null, restoreDir, deleteVkl); });
                     // Items from VaultKeep 0.1 have no key slots yet: give them new keys so re-locking upgrades them.
                     keys = r.Keys ?? VaultKeys.CreateNew(pwd, RegisteredKeysOrEmpty());
                     return r.Restored;
@@ -244,16 +276,20 @@ namespace VaultKeep
         }
 
         /// <summary>Unlocks with a fitting key if one is found, else with the password from stdin.</summary>
-        private static UnlockResult UnlockQuietCore(string path, out int exitCode)
+        private static UnlockResult UnlockQuietCore(string path, string restoreDir, bool deleteVkl, out int exitCode)
         {
             exitCode = 0;
             KeyFile key = VaultCrypto.FindKeyFor(path, FindKeys());
             try
             {
                 if (key != null)
-                    return VaultCrypto.Unlock(path, null, new[] { key });
+                {
+                    try { return VaultCrypto.Unlock(path, null, new[] { key }, restoreDir, deleteVkl); }
+                    catch (NeedPasswordException) { } // key has the right ID but doesn't fit: use the password
+                    catch (WrongPasswordException) { }
+                }
                 string password = Console.In.ReadLine() ?? "";
-                UnlockResult r = VaultCrypto.Unlock(path, password, null);
+                UnlockResult r = VaultCrypto.Unlock(path, password, null, restoreDir, deleteVkl);
                 if (r.Keys == null) r.Keys = VaultKeys.CreateNew(password, KeyStore.LoadRegistered());
                 return r;
             }
@@ -267,19 +303,33 @@ namespace VaultKeep
 
         private static int OpenQuiet(string path, bool launch, int guardSeconds)
         {
+            string openCopy = Recovery.FindOpenCopy(path);
+            if (openCopy != null)
+            {
+                Console.WriteLine(openCopy + "\talready-open");
+                return 0;
+            }
+            string sessionDir = Workspace.CreateSessionDir();
             int code;
-            UnlockResult r = UnlockQuietCore(path, out code);
-            if (r == null) return code;
+            UnlockResult r;
+            try { r = UnlockQuietCore(path, sessionDir, false, out code); }
+            catch { Workspace.DeleteSessionDir(sessionDir); throw; }
+            if (r == null) { Workspace.DeleteSessionDir(sessionDir); return code; }
             Console.WriteLine(r.Restored + (r.UsedKey != null ? "\tkey" : "\tpassword"));
             Console.Out.Flush();
-            Application.Run(new OpenSession(r.Restored, r.Keys, launch, guardSeconds));
+            Application.Run(new OpenSession(r.Restored, path, r.Keys, launch, guardSeconds));
             return 0;
         }
 
         private static int UnlockQuiet(string path)
         {
+            if (Recovery.FindOpenCopy(path) != null)
+            {
+                Console.Error.WriteLine("This item is open right now. Close it first.");
+                return 1;
+            }
             int code;
-            UnlockResult r = UnlockQuietCore(path, out code);
+            UnlockResult r = UnlockQuietCore(path, null, true, out code);
             if (r == null) return code;
             Console.WriteLine(r.Restored + (r.UsedKey != null ? "\tkey" : "\tpassword"));
             if (r.Keys != null) r.Keys.Clear();
@@ -288,21 +338,32 @@ namespace VaultKeep
 
         private static int KeyCreateQuiet(string root)
         {
+#if TESTHOOKS
             string label = OptionValue("--label") ?? "Test key";
             KeyFile key = KeyStore.CreateKey(root, label);
             Console.WriteLine(key.IdHex);
             return 0;
+#else
+            // Adding a key needs Windows sign-in, so there is no silent way to do it in the real app.
+            Console.Error.WriteLine("Adding a security key needs your Windows password: use the VaultKeep window " +
+                                    "or right-click the drive and choose \"Make VaultKeep security key\".");
+            return 1;
+#endif
         }
 
         // ---------------------------------------------------------------- Misc
 
-        /// <summary>Keys on plugged-in drives, plus --key-dir folders (tests).</summary>
+        /// <summary>Keys on plugged-in drives (test build: plus --key-dir folders, and --no-drive-scan).</summary>
         internal static List<KeyFile> FindKeys()
         {
             var extra = new List<string>();
+            bool scanDrives = true;
+#if TESTHOOKS
             for (int i = 0; i < _args.Length - 1; i++)
                 if (_args[i] == "--key-dir") extra.Add(_args[i + 1]);
-            return KeyStore.FindKeyFiles(extra, !HasFlag("--no-drive-scan"));
+            scanDrives = !HasFlag("--no-drive-scan");
+#endif
+            return KeyStore.FindKeyFiles(extra, scanDrives);
         }
 
         internal static List<RegisteredKey> RegisteredKeysOrEmpty()

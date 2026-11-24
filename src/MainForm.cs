@@ -145,6 +145,17 @@ namespace VaultKeep
         // ------------------------------------------------------------ Add key
 
         /// <summary>
+        /// A registered key opens everything locked afterwards, so only the signed-in Windows user may add one:
+        /// someone using an unlocked PC must not be able to slip in their own USB drive.
+        /// </summary>
+        private static bool ConfirmItsYou(IWin32Window owner)
+        {
+            return WindowsAuth.Verify(owner,
+                "Confirm it's you: enter your Windows password to add a VaultKeep security key. " +
+                "A key opens every item you lock from now on.");
+        }
+
+        /// <summary>
         /// Makes a drive a security key (or registers the key it already holds). <paramref name="root"/> null
         /// lets the user pick a drive. Returns true if a key was added.
         /// </summary>
@@ -171,6 +182,7 @@ namespace VaultKeep
                     "This drive already holds the VaultKeep key \"" + existing.Label + "\".\n\nUse it on this PC too?",
                     "VaultKeep", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (use != DialogResult.Yes) return false;
+                if (!ConfirmItsYou(owner)) return false;
                 if (!KeyStore.Register(existing)) Program.Info("This key is already set up on this PC.");
                 return true;
             }
@@ -185,6 +197,7 @@ namespace VaultKeep
                 "Tip: set up a second drive as a backup key.",
                 "VaultKeep", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
             if (confirm != DialogResult.OK) return false;
+            if (!ConfirmItsYou(owner)) return false;
 
             ProgressForm.Run("Creating the key on " + root + "...", delegate { KeyStore.CreateKey(root, label); });
             Program.Info("\"" + label + "\" is ready.\n\n" +

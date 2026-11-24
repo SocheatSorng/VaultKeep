@@ -56,6 +56,15 @@ namespace VaultKeep
         /// </param>
         public static LockResult Lock(string sourcePath, VaultKeys keys, bool replaceStale)
         {
+            return Lock(sourcePath, keys, replaceStale, null);
+        }
+
+        /// <param name="outputPath">
+        /// Where to write the .vkl (null: "&lt;name&gt;.vkl" next to the source). Used when an item opened from the
+        /// private workspace is re-locked back into its original .vkl.
+        /// </param>
+        public static LockResult Lock(string sourcePath, VaultKeys keys, bool replaceStale, string outputPath)
+        {
             string full = Path.GetFullPath(sourcePath).TrimEnd('\\');
             bool isFolder = Directory.Exists(full);
             if (!isFolder && !File.Exists(full))
@@ -71,7 +80,9 @@ namespace VaultKeep
                 EnsureNoReparsePoints(full);
 
             string name = Path.GetFileName(full);
-            string output = Path.Combine(parent, name + Extension);
+            string output = outputPath != null ? Path.GetFullPath(outputPath) : Path.Combine(parent, name + Extension);
+            string outputDir = Path.GetDirectoryName(output);
+            Directory.CreateDirectory(outputDir);
             bool replacing = false;
             if (Directory.Exists(output))
                 throw new IOException("A folder named \"" + Path.GetFileName(output) + "\" already exists here.");
@@ -84,7 +95,7 @@ namespace VaultKeep
 
             // Write to a hidden temp file and rename it into place only when complete, so a crash or
             // power cut never leaves a half-written file under the real .vkl name.
-            string temp = Path.Combine(parent, "." + name + ".vkl-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
+            string temp = Path.Combine(outputDir, "." + name + ".vkl-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
 
             if (!keys.HasPasswordSlot) // the password must always work, whatever keys exist
                 throw new InvalidOperationException("Internal error: locked item would have no password slot.");
@@ -218,8 +229,15 @@ namespace VaultKeep
         /// <exception cref="NeedPasswordException">No key fits and no password was given.</exception>
         public static UnlockResult Unlock(string vklPath, string password, IList<KeyFile> keys)
         {
+            return Unlock(vklPath, password, keys, null, true);
+        }
+
+        /// <param name="restoreDir">Folder to restore into (null: next to the .vkl).</param>
+        /// <param name="deleteVkl">Delete the .vkl afterwards (permanent unlock) or keep it (temporary open).</param>
+        public static UnlockResult Unlock(string vklPath, string password, IList<KeyFile> keys, string restoreDir, bool deleteVkl)
+        {
             string full = Path.GetFullPath(vklPath);
-            string parent = Path.GetDirectoryName(full);
+            string parent = restoreDir != null ? Path.GetFullPath(restoreDir) : Path.GetDirectoryName(full);
             var result = new UnlockResult();
 
             using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
@@ -299,7 +317,7 @@ namespace VaultKeep
                 }
             }
 
-            TryDeleteFile(full);
+            if (deleteVkl) TryDeleteFile(full);
             return result;
         }
 

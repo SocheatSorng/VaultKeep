@@ -5,15 +5,19 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $problems = 0
 
-# 1. Compiler warnings as errors (same sources as build.ps1, output discarded).
+# 1. Compiler warnings as errors, for both the real build and the test build (TESTHOOKS); output discarded.
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$out = Join-Path ([IO.Path]::GetTempPath()) ('vk-lint-' + [Guid]::NewGuid().ToString('N') + '.exe')
 $sources = Get-ChildItem (Join-Path $root 'src') -Filter *.cs | ForEach-Object { $_.FullName }
-& $csc /nologo /target:winexe /warn:4 /warnaserror+ "/out:$out" `
-    /r:System.dll /r:System.Core.dll /r:System.Security.dll /r:Microsoft.CSharp.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
-    $sources
-if ($LASTEXITCODE -ne 0) { Write-Host 'lint: compiler warnings/errors found' -ForegroundColor Red; $problems++ }
-Remove-Item $out -ErrorAction SilentlyContinue
+foreach ($define in @($null, '/define:TESTHOOKS')) {
+    $out = Join-Path ([IO.Path]::GetTempPath()) ('vk-lint-' + [Guid]::NewGuid().ToString('N') + '.exe')
+    $cscArgs = @('/nologo', '/target:winexe', '/warn:4', '/warnaserror+', "/out:$out",
+        '/r:System.dll', '/r:System.Core.dll', '/r:System.Security.dll', '/r:Microsoft.CSharp.dll',
+        '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll')
+    if ($define) { $cscArgs += $define }
+    & $csc @cscArgs $sources
+    if ($LASTEXITCODE -ne 0) { Write-Host "lint: compiler warnings/errors found $define" -ForegroundColor Red; $problems++ }
+    Remove-Item $out -ErrorAction SilentlyContinue
+}
 
 # 2. Text formatting.
 $files = Get-ChildItem $root -Recurse -File -Include *.cs, *.ps1, *.md, *.yml, *.yaml, *.json |

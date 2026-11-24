@@ -4,7 +4,9 @@
 # (registered keys, crash-recovery records) at tests\out\home, and --no-drive-scan stops it from
 # looking at real USB drives, so the user's real keys are never read or changed.
 $ErrorActionPreference = 'Stop'
-$script:Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\VaultKeep.exe'
+# The test build (TESTHOOKS) honours VAULTKEEP_HOME, --key-dir and --no-drive-scan; the real build doesn't.
+$script:Exe = Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\test\VaultKeep.exe'
+$script:RealExe = Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\VaultKeep.exe'
 $script:Out = Join-Path $PSScriptRoot 'out'
 $script:Failures = 0
 $script:Passes = 0
@@ -56,11 +58,37 @@ function Start-OpenSession([string]$vkl, [string]$passwordFile, [int]$GuardSecon
     $id = [Guid]::NewGuid().ToString('N')
     $argList = @('open', "`"$vkl`"", '--password-stdin', '--no-drive-scan', '--no-launch', '--guard-seconds', $GuardSeconds) +
         ($extra | ForEach-Object { "`"$_`"" })
+    $outFile = Join-Path $script:Out "$id.out"
     $p = Start-Process $script:Exe -ArgumentList $argList `
-        -RedirectStandardInput $passwordFile -RedirectStandardOutput (Join-Path $script:Out "$id.out") `
+        -RedirectStandardInput $passwordFile -RedirectStandardOutput $outFile `
         -RedirectStandardError (Join-Path $script:Out "$id.err") -PassThru
     $null = $p.Handle
+    $p | Add-Member NoteProperty OutFile $outFile
     return $p
+}
+
+# Path of the open copy a session printed (in VaultKeep's private workspace), or $null if none in time.
+function Get-OpenCopy($session, [int]$seconds = 15) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $seconds) {
+        if (Test-Path $session.OutFile) {
+            $line = Get-Content $session.OutFile -TotalCount 1 -ErrorAction SilentlyContinue
+            if ($line) {
+                $path = ($line -split "`t")[0]
+                if ((Test-Path $path) -or $session.HasExited) { return $path }
+            }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $null
+}
+
+function Get-WorkspaceRoot { Join-Path $env:VAULTKEEP_HOME 'workspace' }
+
+# Session folders currently in the workspace (each open item gets one).
+function Get-WorkspaceSessions {
+    $root = Get-WorkspaceRoot
+    if (Test-Path $root) { @(Get-ChildItem $root -Directory -Force) } else { @() }
 }
 
 function Wait-Until([scriptblock]$cond, [int]$seconds) {

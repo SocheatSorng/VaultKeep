@@ -10,12 +10,14 @@ using Microsoft.Win32;
 namespace VaultKeep
 {
     /// <summary>
-    /// Runs while a locked item is temporarily unlocked for use. Shows a tray icon, watches the item,
-    /// and re-encrypts it (with the same password, edits included) once nothing is using it any more.
+    /// Runs while a locked item is temporarily open. The unlocked copy lives in VaultKeep's private workspace
+    /// (never next to the .vkl, so sync apps and shared folders never see it); the .vkl stays where it is.
+    /// Shows a tray icon, watches the copy, and once nothing uses it any more writes it (edits included)
+    /// back into the original .vkl with the same keys, then removes the copy.
     ///
     /// After re-locking it keeps watching quietly for a while ("guard"): some programs keep the content in
-    /// memory without holding the file, and a later Save would recreate an unprotected copy. A file that
-    /// reappears is locked again into the .vkl; a folder that reappears is reported (merging it could lose files).
+    /// memory without holding the file, and a later Save would recreate the copy. A file that reappears is
+    /// locked into the .vkl again; a folder that reappears is reported (merging it could lose files).
     /// </summary>
     internal sealed class OpenSession : ApplicationContext
     {
@@ -25,7 +27,9 @@ namespace VaultKeep
         private const int StartupGraceSeconds = 10;  // give the program time to open the file
         private const int FreeChecksNeeded = 3;      // must be unused for ~6 s in a row before re-locking
 
-        private readonly string _path;
+        private readonly string _path;      // the open copy, in the workspace
+        private readonly string _vklPath;   // the original locked file it came from
+        private readonly string _sessionDir;
         private readonly string _name;
         private readonly VaultKeys _keys;
         private readonly bool _isFolder;
@@ -42,15 +46,17 @@ namespace VaultKeep
         private DateTime _guardUntil;
         private bool _finished;
 
-        public OpenSession(string path, VaultKeys keys, bool launch, int guardSeconds)
+        public OpenSession(string path, string vklPath, VaultKeys keys, bool launch, int guardSeconds)
         {
             _path = Path.GetFullPath(path).TrimEnd('\\');
+            _vklPath = Path.GetFullPath(vklPath);
+            _sessionDir = Workspace.SessionDirOf(_path);
             _name = Path.GetFileName(_path);
             _keys = keys;
             _isFolder = Directory.Exists(_path);
             _guardSeconds = guardSeconds;
             _detector = new InUseDetector(_path, _isFolder);
-            _record = Recovery.Add(_path);
+            _record = Recovery.Add(_path, _vklPath);
             _ui.CreateControl();
             IntPtr forceHandle = _ui.Handle;
 
@@ -70,7 +76,7 @@ namespace VaultKeep
             };
             _tray.DoubleClick += delegate { Launch(); };
             _tray.ShowBalloonTip(4000, "VaultKeep",
-                "\"" + _name + "\" is unlocked. It locks again automatically when you close it.", ToolTipIcon.Info);
+                "\"" + _name + "\" is open. It locks again automatically when you close it.", ToolTipIcon.Info);
 
             _timer = new System.Windows.Forms.Timer { Interval = CheckIntervalMs };
             _timer.Tick += OnTick;
@@ -95,8 +101,9 @@ namespace VaultKeep
 
             if (!File.Exists(_path) && !Directory.Exists(_path))
             {
-                // Moved, renamed or deleted by the user: nothing left to lock here.
-                Notify("\"" + _name + "\" was moved or deleted, so VaultKeep stopped watching it.", ToolTipIcon.Warning);
+                // The open copy was moved or deleted. The .vkl was never touched, so nothing is lost.
+                Notify("The open copy of \"" + _name + "\" was moved or deleted. \"" + Path.GetFileName(_vklPath) +
+                       "\" still has the version from before you opened it.", ToolTipIcon.Warning);
                 ExitSoon();
                 return;
             }
@@ -114,7 +121,7 @@ namespace VaultKeep
             if (++_freeChecks >= FreeChecksNeeded) Relock();
         }
 
-        /// <summary>After re-locking: watch for a late Save recreating the item unprotected.</summary>
+        /// <summary>After re-locking: watch for a late Save recreating the copy.</summary>
         private void GuardTick()
         {
             if (DateTime.UtcNow > _guardUntil) { Exit(); return; }
@@ -129,9 +136,9 @@ namespace VaultKeep
                 _timer.Stop();
                 _tray.Visible = true;
                 MessageBox.Show(
-                    "A program saved \"" + _name + "\" again after VaultKeep had locked it.\n\n" +
-                    "The new copy next to \"" + _name + VaultCrypto.Extension + "\" is NOT protected. " +
-                    "Check what it contains, then lock it yourself or delete it.",
+                    "A program saved into \"" + _name + "\" again after VaultKeep had locked it.\n\n" +
+                    "That copy is in VaultKeep's private folder and is NOT inside \"" + Path.GetFileName(_vklPath) + "\":\n" +
+                    _path + "\n\nCheck what it contains, then lock it yourself or delete it.",
                     "VaultKeep", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 Exit();
                 return;
@@ -165,9 +172,8 @@ namespace VaultKeep
             {
                 LockResult result = null;
                 Exception error = null;
-                // replaceStale: an older .vkl of this same item may still be there (e.g. a late save, or the
-                // .vkl could not be deleted when it was opened). The new copy has the latest content.
-                try { result = VaultCrypto.Lock(_path, CurrentKeys(), true); }
+                // Written to a temp file and swapped in, so the .vkl is replaced only by a complete new version.
+                try { result = VaultCrypto.Lock(_path, CurrentKeys(), true, _vklPath); }
                 catch (Exception ex) { error = ex; }
                 if (_finished) return;
                 _ui.BeginInvoke(new Action(() => OnRelocked(result, error, lateSave)));
@@ -189,11 +195,12 @@ namespace VaultKeep
                 return;
             }
 
+            Workspace.RemoveIfEmpty(_sessionDir);
             string message;
             ToolTipIcon icon = ToolTipIcon.Info;
             if (result.UndeletedItems.Count > 0)
             {
-                message = "\"" + _name + "\" was locked, but some original files are still in use and could not be removed.";
+                message = "\"" + _name + "\" was locked, but some open files are still in use and could not be removed.";
                 icon = ToolTipIcon.Warning;
             }
             else if (lateSave)
@@ -224,14 +231,15 @@ namespace VaultKeep
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
-            // Sign-out / shutdown: lock right now if possible, so nothing stays unlocked on disk.
+            // Sign-out / shutdown: lock right now if possible, so no open copy is left behind.
             if (_locking || _finished) return;
             try
             {
                 bool present = _isFolder ? Directory.Exists(_path) && !_guarding : File.Exists(_path);
                 if (present && _detector.GetUseReason() == null)
                 {
-                    VaultCrypto.Lock(_path, CurrentKeys(), true);
+                    VaultCrypto.Lock(_path, CurrentKeys(), true, _vklPath);
+                    Workspace.RemoveIfEmpty(_sessionDir);
                     Recovery.Remove(_record);
                     _finished = true;
                 }
@@ -268,6 +276,7 @@ namespace VaultKeep
             _finished = true;
             _timer.Stop();
             Recovery.Remove(_record);
+            Workspace.RemoveIfEmpty(_sessionDir);
             SystemEvents.SessionEnding -= OnSessionEnding;
             _tray.Visible = false;
             _tray.Dispose();
@@ -281,9 +290,11 @@ namespace VaultKeep
     }
 
     /// <summary>
-    /// Remembers which items are currently unlocked, so that if VaultKeep is killed or the PC crashes
-    /// while something is open, the user is offered to lock it again next time.
+    /// Remembers which items are currently open, so that if VaultKeep is killed or the PC crashes while
+    /// something is open, the user is offered to lock it again next time, and so a second double-click on
+    /// the same .vkl reuses the open copy instead of making another one.
     /// Records are encrypted with Windows DPAPI (current user), so they don't reveal item names.
+    /// Record: pid \n open-copy path \n .vkl path   (VaultKeep 0.2 records have no .vkl line: opened in place.)
     /// </summary>
     internal static class Recovery
     {
@@ -294,11 +305,11 @@ namespace VaultKeep
             get { return Path.Combine(AppPaths.DataDir, "open"); }
         }
 
-        public static string Add(string path)
+        public static string Add(string path, string vklPath)
         {
             Directory.CreateDirectory(Dir);
             string file = Path.Combine(Dir, Guid.NewGuid().ToString("N") + ".rec");
-            byte[] plain = Encoding.UTF8.GetBytes(Process.GetCurrentProcess().Id + "\n" + path);
+            byte[] plain = Encoding.UTF8.GetBytes(Process.GetCurrentProcess().Id + "\n" + path + "\n" + vklPath);
             File.WriteAllBytes(file, ProtectedData.Protect(plain, Entropy, DataProtectionScope.CurrentUser));
             return file;
         }
@@ -308,7 +319,24 @@ namespace VaultKeep
             try { if (record != null) File.Delete(record); } catch { }
         }
 
-        /// <summary>Offers to lock any item that was left unlocked by a VaultKeep that is no longer running.</summary>
+        /// <summary>If <paramref name="vklPath"/> is open right now in a running session, the open copy's path.</summary>
+        public static string FindOpenCopy(string vklPath)
+        {
+            if (!Directory.Exists(Dir)) return null;
+            string want = Path.GetFullPath(vklPath);
+            foreach (string record in Directory.GetFiles(Dir, "*.rec"))
+            {
+                string[] lines = ReadRecord(record);
+                if (lines == null || lines.Length < 3) continue;
+                int pid;
+                if (!int.TryParse(lines[0], out pid) || !IsVaultKeepRunning(pid)) continue;
+                if (!string.Equals(lines[2], want, StringComparison.OrdinalIgnoreCase)) continue;
+                if (File.Exists(lines[1]) || Directory.Exists(lines[1])) return lines[1];
+            }
+            return null;
+        }
+
+        /// <summary>Offers to lock any item that was left open by a VaultKeep that is no longer running.</summary>
         public static void PromptForOrphans()
         {
             if (!Directory.Exists(Dir)) return;
@@ -321,13 +349,43 @@ namespace VaultKeep
                 if (int.TryParse(lines[0], out pid) && IsVaultKeepRunning(pid)) continue;
 
                 string path = lines[1];
-                if (!File.Exists(path) && !Directory.Exists(path)) { Remove(record); continue; }
+                if (!File.Exists(path) && !Directory.Exists(path))
+                {
+                    Workspace.RemoveIfEmpty(Workspace.SessionDirOf(path));
+                    Remove(record);
+                    continue;
+                }
 
+                if (lines.Length < 3)
+                {
+                    // VaultKeep 0.2: the item was opened in place.
+                    var old = MessageBox.Show(
+                        "\"" + path + "\" was left unlocked because VaultKeep closed unexpectedly.\n\nLock it now?",
+                        "VaultKeep", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (old == DialogResult.Yes && !Program.LockWithPrompt(path, true, null)) continue;
+                    Remove(record);
+                    continue;
+                }
+
+                string vklPath = lines[2];
+                string sessionDir = Workspace.SessionDirOf(path);
                 var answer = MessageBox.Show(
-                    "\"" + path + "\" was left unlocked because VaultKeep closed unexpectedly.\n\nLock it now?",
-                    "VaultKeep", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                // replaceStale: the .vkl next to it (if any) is the older copy from before it was opened.
-                if (answer == DialogResult.Yes && !Program.LockWithPrompt(path, true)) continue; // cancelled: ask again next time
+                    "\"" + Path.GetFileName(path) + "\" was still open when VaultKeep closed unexpectedly. " +
+                    "The open copy is in VaultKeep's private folder.\n\n" +
+                    "Yes: lock it into \"" + vklPath + "\", keeping any changes you made.\n" +
+                    "No: throw the open copy away. The locked file keeps the version from before you opened it.\n" +
+                    "Cancel: ask me later.",
+                    "VaultKeep", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+                if (answer == DialogResult.Cancel) continue;
+                if (answer == DialogResult.Yes)
+                {
+                    if (!Program.LockWithPrompt(path, true, vklPath)) continue; // cancelled: ask again next time
+                    Workspace.RemoveIfEmpty(sessionDir);
+                }
+                else
+                {
+                    if (sessionDir != null) Workspace.DeleteSessionDir(sessionDir);
+                }
                 Remove(record);
             }
         }
