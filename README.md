@@ -39,7 +39,14 @@ the password.** Without the drive, the password still works, so losing the drive
   and each item drops it the next time you open it. Open your important items once so the lost key stops working on them.
 - Using the same drive on another PC: on that PC, choose **Add USB key...** with the drive plugged in. VaultKeep
   sees the existing key and offers to use it there too.
-- Anyone holding the drive can open your locked items, so keep it safe like a house key.
+- **PIN:** new keys get a PIN (at least 6 characters). With the key plugged in, VaultKeep asks for the
+  PIN instead of the item password; choose **Use password** if you'd rather type the password.
+  The PIN encrypts the key on the drive, so a copy of the key file is useless without it.
+  Keys made before PINs existed keep working without one. Add or change a PIN with
+  `VaultKeep.exe` → select the key → **Change PIN...** (the drive must be plugged in).
+- A PIN only slows down someone who copied the key file: they can try PINs on their own computer as
+  fast as their hardware allows. A 6-digit PIN can be guessed this way; letters and numbers mixed,
+  8+ characters, are far stronger. Keep the drive safe like a house key either way.
 
 **Can someone else's USB drive open my items?** No:
 

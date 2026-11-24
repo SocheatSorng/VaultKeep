@@ -13,6 +13,7 @@ namespace VaultKeep
         private readonly Button _menuButton;
         private readonly ListView _keys;
         private readonly Button _removeKey;
+        private readonly Button _changePin;
 
         public MainForm()
         {
@@ -58,13 +59,21 @@ namespace VaultKeep
             _keys.Columns.Add("Name", 190);
             _keys.Columns.Add("Status", 150);
             _keys.Columns.Add("Added", 100);
-            _keys.SelectedIndexChanged += delegate { _removeKey.Enabled = _keys.SelectedItems.Count > 0; };
+            _keys.SelectedIndexChanged += delegate
+            {
+                bool selected = _keys.SelectedItems.Count > 0 && _keys.SelectedItems[0].Tag is RegisteredKey;
+                _removeKey.Enabled = selected;
+                _changePin.Enabled = selected;
+            };
             Controls.Add(_keys);
 
             var addKey = new Button { Text = "Add USB key...", Location = new Point(16, 330), Size = new Size(120, 28) };
             addKey.Click += delegate { if (CreateKeyOnDrive(this, null)) RefreshAll(); };
             _removeKey = new Button { Text = "Remove key", Location = new Point(144, 330), Size = new Size(100, 28), Enabled = false };
             _removeKey.Click += delegate { RemoveSelectedKey(); };
+            _changePin = new Button { Text = "Change PIN...", Location = new Point(252, 330), Size = new Size(110, 28), Enabled = false };
+            _changePin.Click += delegate { ChangePinOfSelectedKey(); };
+            Controls.Add(_changePin);
             var close = new Button { Text = "Close", Location = new Point(384, 362), Size = new Size(80, 28), DialogResult = DialogResult.Cancel };
             close.Click += delegate { Close(); };
             Controls.Add(addKey);
@@ -93,6 +102,7 @@ namespace VaultKeep
             if (_keys.Items.Count == 0)
                 _keys.Items.Add(new ListViewItem(new[] { "No keys yet: click \"Add USB key...\"", "", "" }) { ForeColor = SystemColors.GrayText });
             _removeKey.Enabled = false;
+            _changePin.Enabled = false;
             RefreshKeyStatus();
         }
 
@@ -104,9 +114,8 @@ namespace VaultKeep
                 var k = item.Tag as RegisteredKey;
                 if (k == null) continue;
                 KeyFile found = present.Find(p => KeyStore.BytesEqual(p.Id, k.Id));
-                item.SubItems[1].Text = found != null
-                    ? "Plugged in (" + Path.GetPathRoot(found.Path).TrimEnd('\\') + ")"
-                    : "Not plugged in";
+                item.SubItems[1].Text = found == null ? "Not plugged in"
+                    : "Plugged in (" + Path.GetPathRoot(found.Path).TrimEnd('\\') + ")" + (found.NeedsPin ? "" : ", no PIN");
             }
         }
 
@@ -122,6 +131,38 @@ namespace VaultKeep
             {
                 Shell.Install();
             }
+            RefreshAll();
+        }
+
+        /// <summary>Sets a PIN on a key that has none, or changes it (needs the current PIN). The drive must be plugged in.</summary>
+        private void ChangePinOfSelectedKey()
+        {
+            if (_keys.SelectedItems.Count == 0) return;
+            var k = _keys.SelectedItems[0].Tag as RegisteredKey;
+            if (k == null) return;
+            KeyFile file = KeyStore.FindKeyFiles(null, true).Find(f => KeyStore.BytesEqual(f.Id, k.Id));
+            if (file == null)
+            {
+                Program.Info("Plug in the drive with \"" + k.Label + "\" first.");
+                return;
+            }
+
+            string error = null;
+            while (true)
+            {
+                string current, pin;
+                using (var f = new PinForm(k.Label, true, file.NeedsPin, error))
+                {
+                    if (f.ShowDialog(this) != DialogResult.OK) return;
+                    current = f.CurrentPin;
+                    pin = f.Pin;
+                }
+                bool ok = false;
+                ProgressForm.Run("Saving the PIN on the drive...", delegate { ok = KeyStore.ChangePin(file.Path, current, pin); });
+                if (ok) break;
+                error = "The current PIN is wrong.";
+            }
+            Program.Info("The PIN of \"" + k.Label + "\" is set. You'll be asked for it when you open items with this key.");
             RefreshAll();
         }
 
@@ -199,7 +240,14 @@ namespace VaultKeep
             if (confirm != DialogResult.OK) return false;
             if (!ConfirmItsYou(owner)) return false;
 
-            ProgressForm.Run("Creating the key on " + root + "...", delegate { KeyStore.CreateKey(root, label); });
+            string pin;
+            using (var pinForm = new PinForm(label, true, false, null))
+            {
+                if (pinForm.ShowDialog(owner) != DialogResult.OK) return false;
+                pin = pinForm.Pin;
+            }
+
+            ProgressForm.Run("Creating the key on " + root + "...", delegate { KeyStore.CreateKey(root, label, pin); });
             Program.Info("\"" + label + "\" is ready.\n\n" +
                          "Items you lock from now on open with it. Items locked earlier get it the next time you open " +
                          "them with the password.");

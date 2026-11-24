@@ -24,6 +24,9 @@ After every code change: run lint, build and the tests (full suite if `OpenSessi
   Every item must keep a password slot.
 - `src/KeyStore.cs`: USB security keys: private key file on the drive (`.vaultkeep\vaultkeep.vkkey`),
   public keys registered per PC in `keys.dat` (DPAPI). `AppPaths.DataDir` honours `VAULTKEEP_HOME` (test build only).
+  Key files are VKKEY2 (VKKEY1 still read): ID + public half readable, private half optionally PIN-encrypted
+  (`PinBox`: PBKDF2 600k + AES-256-CBC + HMAC over ID/public half). New keys need a PIN (min 6).
+  Script mode stdin for open/unlock: line 1 = item password, line 2 = key PIN.
 - `src/MainForm.cs`: window shown when the exe runs without arguments: right-click menu + key management.
 - `src/Pbkdf2.cs`: PBKDF2 via native CNG (`BCryptDeriveKeyPBKDF2`), managed fallback.
 - `src/Workspace.cs`: private folder for opened items (`<DataDir>\workspace\<session>\<item>`); every delete

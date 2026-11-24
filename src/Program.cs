@@ -66,6 +66,18 @@ namespace VaultKeep
                     case "key-create":
                         if (!RequirePath(path)) return 1;
                         return quiet ? KeyCreateQuiet(path) : (MainForm.CreateKeyOnDrive(null, path) ? 0 : 2);
+                    case "key-pin":
+                        // Script mode: set/change the PIN of the key on drive/folder <path>. stdin: current PIN
+                        // (ignored if the key has none), new PIN. Needs the current PIN, so no sign-in is required.
+                        if (!RequirePath(path)) return 1;
+                        if (!quiet) { Application.Run(new MainForm()); return 0; }
+                        {
+                            string current = Console.In.ReadLine();
+                            string next = Console.In.ReadLine();
+                            if (KeyStore.ChangePin(KeyStore.KeyFilePath(path), current, next)) return 0;
+                            Console.Error.WriteLine("The current PIN is wrong.");
+                            return 4;
+                        }
                     case "key-remove":
                         if (!RequirePath(path)) return 1;
                         return KeyStore.Unregister(KeyStore.FromHex(path)) ? 0 : 1;
@@ -210,6 +222,13 @@ namespace VaultKeep
             while (true)
             {
                 KeyFile key = VaultCrypto.FindKeyFor(path, usableKeys());
+                if (key != null && !UnlockKeyWithPin(key))
+                {
+                    // PIN cancelled: don't ask again for this key; use the item password instead.
+                    failedKeys.Add(key.IdHex + "|" + key.Path);
+                    showKeyHint = false;
+                    key = null;
+                }
                 if (key != null)
                 {
                     try
@@ -257,6 +276,26 @@ namespace VaultKeep
             }
         }
 
+        /// <summary>Asks for the key's PIN until it's right. False if the user chose to use the password instead.</summary>
+        private static bool UnlockKeyWithPin(KeyFile key)
+        {
+            if (!key.NeedsPin || key.IsUnlocked) return true;
+            string error = null;
+            while (true)
+            {
+                string pin;
+                using (var f = new PinForm(key.Label, false, false, error))
+                {
+                    if (f.ShowDialog() != DialogResult.OK) return false;
+                    pin = f.Pin;
+                }
+                bool ok = false;
+                ProgressForm.Run("Checking the PIN...", delegate { ok = key.TryUnlock(pin); });
+                if (ok) return true;
+                error = "Wrong PIN. Try again.";
+            }
+        }
+
         // ---------------------------------------------------------- Script mode
 
         private static int LockQuiet(string path)
@@ -276,11 +315,17 @@ namespace VaultKeep
             return result.UndeletedItems.Count == 0 ? 0 : 3;
         }
 
-        /// <summary>Unlocks with a fitting key if one is found, else with the password from stdin.</summary>
+        /// <summary>
+        /// Unlocks with a fitting key if one is found (stdin line 2 is its PIN, if it has one), else with the
+        /// password (stdin line 1).
+        /// </summary>
         private static UnlockResult UnlockQuietCore(string path, string restoreDir, bool deleteVkl, out int exitCode)
         {
             exitCode = 0;
+            string password = Console.In.ReadLine() ?? "";
+            string pin = Console.In.ReadLine();
             KeyFile key = VaultCrypto.FindKeyFor(path, FindKeys());
+            if (key != null && !key.TryUnlock(pin) && key.NeedsPin) key = null; // wrong or no PIN: use the password
             try
             {
                 if (key != null)
@@ -289,7 +334,6 @@ namespace VaultKeep
                     catch (NeedPasswordException) { } // key has the right ID but doesn't fit: use the password
                     catch (WrongPasswordException) { }
                 }
-                string password = Console.In.ReadLine() ?? "";
                 UnlockResult r = VaultCrypto.Unlock(path, password, null, restoreDir, deleteVkl);
                 if (r.Keys == null) r.Keys = VaultKeys.CreateNew(password, KeyStore.LoadRegistered());
                 return r;
@@ -341,7 +385,9 @@ namespace VaultKeep
         {
 #if TESTHOOKS
             string label = OptionValue("--label") ?? "Test key";
-            KeyFile key = KeyStore.CreateKey(root, label);
+            // --with-pin: PIN from stdin line 1. Without it the test key has no PIN (like VaultKeep 0.2 keys).
+            string pin = HasFlag("--with-pin") ? Console.In.ReadLine() : null;
+            KeyFile key = KeyStore.CreateKey(root, label, pin);
             Console.WriteLine(key.IdHex);
             return 0;
 #else

@@ -140,4 +140,85 @@ $raw[200] = $raw[200] -bxor 1   # inside the key slot
 $r = Invoke-VaultKeep unlock "$t\plain.txt.vkl" $pw
 Check ($r.Code -eq 4 -and -not (Test-Path "$t\plain.txt")) 'tampered key slot: file rejected even with the right password'
 
+Write-Host 'Security key with a PIN'
+# stdin for unlock/open: line 1 = item password, line 2 = key PIN.
+function New-Stdin([string[]]$lines) {
+    $f = Join-Path $t ('in-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    [IO.File]::WriteAllText($f, ($lines -join "`r`n") + "`r`n", [Text.Encoding]::ASCII)
+    return $f
+}
+function Get-KeyProtection([string]$keyPath) {
+    $r = New-Object IO.BinaryReader([IO.File]::OpenRead($keyPath))
+    try {
+        $magic = [Text.Encoding]::ASCII.GetString($r.ReadBytes(6)); $null = $r.ReadBytes(16); $null = $r.ReadString()
+        $null = $r.ReadBytes($r.ReadInt32()); $null = $r.ReadBytes($r.ReadInt32())
+        return "$magic/$($r.ReadByte())"
+    } finally { $r.Close() }
+}
+$usbP = Join-Path $t 'usb-pin'; New-Item -ItemType Directory $usbP | Out-Null
+$r = Invoke-VaultKeep key-create $usbP (New-Stdin @('12345')) @('--with-pin')
+Check ($r.Code -eq 1 -and -not (Test-Path (Join-Path $usbP '.vaultkeep\vaultkeep.vkkey'))) 'a PIN shorter than 6 characters is refused'
+$r = Invoke-VaultKeep key-create $usbP (New-Stdin @('blue-42-sky')) @('--with-pin', '--label', 'PIN key')
+$pinKey = Join-Path $usbP '.vaultkeep\vaultkeep.vkkey'
+Check ($r.Code -eq 0 -and (Get-KeyProtection $pinKey) -eq 'VKKEY2/1') "key created with its private half PIN-encrypted $($r.Err)"
+
+$item = Join-Path $t 'pin-item.txt'; Set-Content $item 'guarded by a PIN'
+$null = Invoke-VaultKeep lock $item $pw
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1', 'blue-42-sky')) @('--key-dir', $usbP)
+Check ($r.Code -eq 0 -and $r.Out -match "`tkey") 'key + right PIN opens it without the password'
+$null = Invoke-VaultKeep lock $item $pw
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1', 'not-the-pin')) @('--key-dir', $usbP)
+Check ($r.Code -eq 4 -and (Test-Path "$item.vkl")) 'key + wrong PIN does not open it'
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('correct-horse-9', 'not-the-pin')) @('--key-dir', $usbP)
+Check ($r.Code -eq 0 -and $r.Out -match "`tpassword") 'wrong PIN falls back to the password'
+
+$null = Invoke-VaultKeep lock $item $pw
+$stolen = Join-Path $t 'stolen-copy'; New-Item -ItemType Directory $stolen | Out-Null
+Copy-Item (Join-Path $usbP '.vaultkeep') $stolen -Recurse -Force
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1')) @('--key-dir', $stolen)
+Check ($r.Code -eq 4 -and (Test-Path "$item.vkl")) 'a copied key file without the PIN opens nothing'
+
+Write-Host 'Changing a PIN'
+$r = Invoke-VaultKeep key-pin $usbP (New-Stdin @('not-the-pin', 'new-pin-77'))
+Check ($r.Code -eq 4) 'changing the PIN needs the current PIN'
+$r = Invoke-VaultKeep key-pin $usbP (New-Stdin @('blue-42-sky', 'new-pin-77'))
+Check ($r.Code -eq 0 -and (Get-KeyProtection $pinKey) -eq 'VKKEY2/1') 'PIN changed'
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1', 'blue-42-sky')) @('--key-dir', $usbP)
+Check ($r.Code -eq 4) 'the old PIN no longer works'
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1', 'new-pin-77')) @('--key-dir', $usbP)
+Check ($r.Code -eq 0 -and $r.Out -match "`tkey") 'the new PIN works'
+
+Write-Host 'Adding a PIN to a key that had none'
+$usbN = Join-Path $t 'usb-nopin'; New-Item -ItemType Directory $usbN | Out-Null
+$null = Invoke-VaultKeep key-create $usbN $null
+$noPinKey = Join-Path $usbN '.vaultkeep\vaultkeep.vkkey'
+Check ((Get-KeyProtection $noPinKey) -eq 'VKKEY2/0') 'key without a PIN'
+$null = Invoke-VaultKeep lock $item $pw
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1')) @('--key-dir', $usbN)
+Check ($r.Code -eq 0) 'a key without a PIN opens it on its own'
+$null = Invoke-VaultKeep lock $item $pw
+$r = Invoke-VaultKeep key-pin $usbN (New-Stdin @('', 'fresh-pin-1'))
+Check ($r.Code -eq 0 -and (Get-KeyProtection $noPinKey) -eq 'VKKEY2/1') 'PIN added'
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1')) @('--key-dir', $usbN)
+Check ($r.Code -eq 4) 'now it needs the PIN'
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1', 'fresh-pin-1')) @('--key-dir', $usbN)
+Check ($r.Code -eq 0) '...and opens with it'
+
+Write-Host 'Keys from VaultKeep 0.2 (VKKEY1) still work'
+# Rebuild an old-format file from an unprotected key: VKKEY1 | id | label | modulus | exponent | 6 private parts.
+$usbOld = Join-Path $t 'usb-old'; New-Item -ItemType Directory $usbOld | Out-Null
+$null = Invoke-VaultKeep key-create $usbOld $null
+$oldKey = Join-Path $usbOld '.vaultkeep\vaultkeep.vkkey'
+$null = Invoke-VaultKeep lock $item $pw   # locked after the key is registered, so it has a slot for it
+$bytes = [IO.File]::ReadAllBytes($oldKey)
+$r2 = New-Object IO.BinaryReader((New-Object IO.MemoryStream(, $bytes)))
+$null = $r2.ReadBytes(6); $null = $r2.ReadBytes(16); $null = $r2.ReadString()
+$null = $r2.ReadBytes($r2.ReadInt32()); $null = $r2.ReadBytes($r2.ReadInt32())
+$headerEnd = $r2.BaseStream.Position
+$null = $r2.ReadByte(); $blobLen = $r2.ReadInt32(); $blob = $r2.ReadBytes($blobLen)
+$v1 = [byte[]]([Text.Encoding]::ASCII.GetBytes('VKKEY1') + $bytes[6..($headerEnd - 1)] + $blob)
+[IO.File]::WriteAllBytes($oldKey, $v1)
+$r = Invoke-VaultKeep unlock "$item.vkl" (New-Stdin @('wrong-pass-1')) @('--key-dir', $usbOld)
+Check ($r.Code -eq 0 -and $r.Out -match "`tkey") 'old key file (no PIN) still opens items'
+
 Remove-Item -Recurse -Force $t
