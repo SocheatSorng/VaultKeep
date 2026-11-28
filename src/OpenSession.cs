@@ -50,7 +50,10 @@ namespace VaultKeep
         private DateTime _guardUntil;
         private bool _finished;
 
-        public OpenSession(string path, string vklPath, VaultKeys keys, bool launch, int guardSeconds)
+        /// <param name="snapshot">Workspace.Snapshot of the copy, taken right after it was decrypted and before it
+        /// was announced or launched (null: always re-lock). Taking it here instead could include an early edit
+        /// and then throw that edit away as "unchanged".</param>
+        public OpenSession(string path, string vklPath, VaultKeys keys, bool launch, int guardSeconds, string snapshot)
         {
             _path = Path.GetFullPath(path).TrimEnd('\\');
             _vklPath = Path.GetFullPath(vklPath);
@@ -60,7 +63,7 @@ namespace VaultKeep
             _isFolder = Directory.Exists(_path);
             _guardSeconds = guardSeconds;
             _detector = new InUseDetector(_path, _isFolder);
-            _snapshot = SafeSnapshot();
+            _snapshot = snapshot;
             _record = Recovery.Add(_path, _vklPath);
             _ui.CreateControl();
             IntPtr forceHandle = _ui.Handle;
@@ -318,7 +321,13 @@ namespace VaultKeep
 
         private string SafeSnapshot()
         {
-            try { return Workspace.Snapshot(_path); }
+            return TakeSnapshot(_path);
+        }
+
+        /// <summary>Fingerprint of an open copy, or null if it can't be read (then it's re-locked normally).</summary>
+        public static string TakeSnapshot(string path)
+        {
+            try { return Workspace.Snapshot(Path.GetFullPath(path).TrimEnd('\\')); }
             catch { return null; } // can't tell: treat as changed and re-lock normally
         }
 

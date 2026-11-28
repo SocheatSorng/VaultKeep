@@ -182,7 +182,8 @@ namespace VaultKeep
             try { restored = PromptAndUnlock(path, "Opening", out keys, sessionDir, false); }
             catch { Workspace.DeleteSessionDir(sessionDir); throw; }
             if (restored == null) { Workspace.DeleteSessionDir(sessionDir); return 2; }
-            Application.Run(new OpenSession(restored, path, keys, true, OpenSession.DefaultGuardSeconds));
+            string snapshot = OpenSession.TakeSnapshot(restored);
+            Application.Run(new OpenSession(restored, path, keys, true, OpenSession.DefaultGuardSeconds, snapshot));
             return 0;
         }
 
@@ -363,9 +364,16 @@ namespace VaultKeep
             try { r = UnlockQuietCore(path, sessionDir, false, out code); }
             catch { Workspace.DeleteSessionDir(sessionDir); throw; }
             if (r == null) { Workspace.DeleteSessionDir(sessionDir); return code; }
+            string snapshot = OpenSession.TakeSnapshot(r.Restored); // before announcing: see OpenSession
             Console.WriteLine(r.Restored + (r.UsedKey != null ? "\tkey" : "\tpassword"));
             Console.Out.Flush();
-            Application.Run(new OpenSession(r.Restored, path, r.Keys, launch, guardSeconds));
+#if TESTHOOKS
+            // Test option: widen the gap between announcing the copy and starting the session, so a test can
+            // prove an edit made right after the announcement is still locked in.
+            int delay;
+            if (int.TryParse(OptionValue("--start-delay-ms"), out delay) && delay > 0) System.Threading.Thread.Sleep(delay);
+#endif
+            Application.Run(new OpenSession(r.Restored, path, r.Keys, launch, guardSeconds, snapshot));
             return 0;
         }
 
@@ -422,7 +430,7 @@ namespace VaultKeep
             catch { return new List<RegisteredKey>(); }
         }
 
-        private static readonly string[] OptionsWithValue = { "--label", "--key-dir", "--guard-seconds" };
+        private static readonly string[] OptionsWithValue = { "--label", "--key-dir", "--guard-seconds", "--start-delay-ms" };
 
         /// <summary>
         /// The first argument after the command that isn't an option, cleaned up. Explorer passes a drive as
