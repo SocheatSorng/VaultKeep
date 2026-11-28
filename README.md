@@ -92,6 +92,7 @@ If a *folder* reappears, VaultKeep warns you instead of merging it, so no files 
 
 ```powershell
 .\build.ps1            # -> bin\VaultKeep.exe (the app) + bin\test\VaultKeep.exe (test build, never install it)
+.\build.ps1 -Installer # also dist\VaultKeep-Setup-X.Y.Z.exe + SHA256SUMS.txt (needs Inno Setup 6)
 .\lint.ps1             # warnings as errors + formatting checks
 .\test.ps1 -Headless   # lock/unlock round trips, wrong password, tampering, safety checks
 .\test.ps1             # also the open/auto-relock tests (briefly opens Notepad and File Explorer)
@@ -109,7 +110,28 @@ pre-commit install       # gitleaks, private-key check, lint, zizmor on every co
 GitHub Actions (`.github/workflows`) run lint + build + tests, a secret scan, a workflow audit
 and CodeQL on every push. Dependabot keeps the pinned actions up to date.
 
-## Install the right-click menu
+## Install
+
+Download **VaultKeep-Setup-X.Y.Z.exe** from the
+[latest release](https://github.com/SocheatSorng/VaultKeep/releases/latest) and run it. It installs for
+your Windows account only (`%LOCALAPPDATA%\Programs\VaultKeep`, no admin rights) and adds the right-click
+menu. The installer isn't code-signed, so SmartScreen may warn: compare the download with the release's
+`SHA256SUMS.txt` (`Get-FileHash`), then **More info** → **Run anyway**.
+
+- **Update:** run the newer installer. Items that are open keep working (the running copy is moved aside).
+- **Uninstall:** Settings → Apps → VaultKeep. It removes the right-click menu. Your `.vkl` files, USB keys
+  and `%LOCALAPPDATA%\VaultKeep` (registered keys, crash-recovery notes) are kept, so reinstalling
+  picks up where you left off. Close opened items first: the uninstaller refuses while VaultKeep is running.
+
+### Releasing (maintainers)
+
+1. Set the version in `src/Program.cs` (`AssemblyVersion`, `AssemblyFileVersion`, `AssemblyInformationalVersion`).
+2. `.\build.ps1 -Installer` builds `dist\VaultKeep-Setup-X.Y.Z.exe` locally (needs
+   [Inno Setup 6](https://jrsoftware.org/isinfo.php): `winget install JRSoftware.InnoSetup`). Try it.
+3. Push a tag `vX.Y.Z` on `main`. `.github/workflows/release.yml` checks the tag matches the version, lints,
+   builds, tests and publishes the installer and `SHA256SUMS.txt` to a GitHub Release.
+
+## Install the right-click menu without the installer
 
 Run `bin\VaultKeep.exe` (no arguments) and click **Yes**. Run it again to remove the menu.
 It registers for the current user only (`HKCU\Software\Classes`, plus a sign-in entry under
@@ -118,7 +140,7 @@ If you move `VaultKeep.exe`, run it again to update the menu path.
 
 Run `VaultKeep.exe` with no arguments for the VaultKeep window (right-click menu and security keys).
 
-Command line: `VaultKeep.exe install | uninstall | lock <path> | open <path.vkl> | unlock <path.vkl> | key-create <drive> | recover`
+Command line: `VaultKeep.exe install | uninstall [--quiet] | lock <path> | open <path.vkl> | unlock <path.vkl> | key-create <drive> | recover`
 
 ## Security
 
@@ -145,3 +167,7 @@ Command line: `VaultKeep.exe install | uninstall | lock <path> | open <path.vkl>
 - Selecting several items asks for a password once per item.
 - Folders that contain symbolic links or junctions are refused.
 - A whole folder is processed as one stream, so very large folders take a while. A progress window is shown.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

@@ -8,6 +8,7 @@ private local workspace, opens it, and writes it back into the .vkl once it's cl
 
 ```powershell
 .\build.ps1            # build bin\VaultKeep.exe (csc.exe from .NET Framework 4.8, no SDK needed)
+.\build.ps1 -Installer # + dist\VaultKeep-Setup-<ver>.exe and SHA256SUMS.txt (Inno Setup 6)
 .\lint.ps1             # compiler warnings as errors (/warn:4) + formatting checks
 .\test.ps1 -Headless   # crypto + security-key tests (~2 min, what CI runs)
 .\test.ps1             # + session tests: open Notepad/Explorer briefly, need a desktop (~3 min)
@@ -43,6 +44,9 @@ After every code change: run lint, build and the tests (full suite if `OpenSessi
 - `src/Dialogs.cs`: password and progress dialogs. `src/Shell.cs`: HKCU right-click menu + Run key.
 - `src/Program.cs`: commands `install | uninstall | lock | open | unlock | recover`;
   `--password-stdin` (and `--no-launch` for open) give a dialog-free mode used by the tests.
+- `installer.iss`: per-user Inno Setup installer. Ships only `bin\VaultKeep.exe`, runs `install --quiet` /
+  `uninstall --quiet`, renames a running exe aside (never closes it), never deletes the data folder.
+  `.github/workflows/release.yml`: a tag `vX.Y.Z` (must match `src/Program.cs`) builds, tests and publishes it.
 - `tests/`: PowerShell tests driving the exe in script mode; scratch data only under `tests/out/`.
 
 ## Rules

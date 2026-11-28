@@ -6,7 +6,10 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("VaultKeep")]
 [assembly: System.Reflection.AssemblyProduct("VaultKeep")]
-[assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
+// The release version: build.ps1 reads it for the installer, and the release workflow checks the tag matches.
+[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.0")]
 
 namespace VaultKeep
 {
@@ -18,7 +21,7 @@ namespace VaultKeep
         /// <summary>
         /// Usage:
         ///   VaultKeep.exe                       -> VaultKeep window: right-click menu + security keys
-        ///   VaultKeep.exe install | uninstall
+        ///   VaultKeep.exe install | uninstall   (--quiet: no message; used by the installer)
         ///   VaultKeep.exe lock   "path"         -> prompt for password, lock file/folder
         ///   VaultKeep.exe open   "path.vkl"     -> security key or password, open it, re-lock when it's closed
         ///   VaultKeep.exe unlock "path.vkl"     -> security key or password, unlock permanently
@@ -86,11 +89,11 @@ namespace VaultKeep
                         return 0;
                     case "install":
                         Shell.Install();
-                        Info("The \"Lock with VaultKeep\" option was added to the right-click menu for files and folders.");
+                        if (!quiet) Info("The \"Lock with VaultKeep\" option was added to the right-click menu for files and folders.");
                         return 0;
                     case "uninstall":
                         Shell.Uninstall();
-                        Info("VaultKeep was removed from the right-click menu. Your locked .vkl files are not affected.");
+                        if (!quiet) Info("VaultKeep was removed from the right-click menu. Your locked .vkl files are not affected.");
                         return 0;
                     case "":
                     case "keys":

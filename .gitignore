@@ -30,3 +30,6 @@ secrets*.json
 *.suo
 Thumbs.db
 desktop.ini
+
+# Installer output (build.ps1 -Installer)
+dist/

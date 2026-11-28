@@ -1,0 +1,104 @@
+name: Release
+
+# Pushing a tag vX.Y.Z on a commit that is on main (and matches the version in src/Program.cs) lints,
+# builds and tests VaultKeep, builds the installer from bin\VaultKeep.exe (never the test build) and
+# publishes it to a GitHub Release.
+# Two jobs: the repo's own scripts run only in `build` (read-only token); `publish` holds the write
+# token and runs no repo code, only gh on the downloaded installer.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+jobs:
+  build:
+    name: Lint, build, test, installer
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check the tag is on main and matches the app version
+        shell: powershell
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Tag $env:TAG is not on main: only commits on main are released." }
+          $src = [IO.File]::ReadAllText("$PWD\src\Program.cs")
+          if ($src -notmatch 'AssemblyInformationalVersion\("(\d+\.\d+\.\d+)"\)') { throw 'Version not found in src\Program.cs' }
+          if ($env:TAG -ne "v$($Matches[1])") { throw "Tag $env:TAG does not match the app version $($Matches[1])." }
+
+      - name: Lint
+        shell: powershell
+        run: .\lint.ps1
+
+      # Inno Setup 6 is preinstalled on GitHub's Windows runners; build.ps1 stops if it's missing.
+      - name: Build app and installer
+        shell: powershell
+        run: .\build.ps1 -Installer
+
+      - name: Test
+        shell: powershell
+        run: .\test.ps1 -Headless
+
+      - name: Prepare release notes
+        shell: powershell
+        run: |
+          $utf8 = New-Object Text.UTF8Encoding $false
+          $sums = ([IO.File]::ReadAllText("$PWD\dist\SHA256SUMS.txt", $utf8)).Trim()
+          $fence = '```'
+          $notes = [IO.File]::ReadAllText("$PWD\.github\release-notes.md", $utf8) + "`n${fence}text`n$sums`n$fence`n"
+          [IO.File]::WriteAllText("$PWD\dist\notes.md", $notes, $utf8)
+
+      - name: Upload installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload the installer
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+
+      - name: Download installer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          setup=$(ls dist/VaultKeep-Setup-*.exe)
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          gh release create "$TAG" "$setup" dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "VaultKeep ${TAG#v}" --notes-file dist/notes.md

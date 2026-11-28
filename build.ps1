@@ -3,6 +3,9 @@
 #   bin\test\VaultKeep.exe   test build (TESTHOOKS): adds options only the tests may use, such as
 #                            VAULTKEEP_HOME, --key-dir, --no-drive-scan and adding keys without
 #                            Windows sign-in. Never install or ship it.
+#   -Installer               also dist\VaultKeep-Setup-<version>.exe + dist\SHA256SUMS.txt (Inno Setup 6),
+#                            from bin\VaultKeep.exe only. <version> comes from src\Program.cs.
+param([switch]$Installer)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -35,3 +38,33 @@ foreach ($variant in @(@{ Dir = 'bin'; Define = $null }, @{ Dir = 'bin\test'; De
     if ($LASTEXITCODE -ne 0) { throw "Build failed ($($variant.Dir))." }
     Write-Host "Built $out\VaultKeep.exe"
 }
+
+if (-not $Installer) { return }
+
+# --- Installer (Inno Setup 6)
+$programCs = Get-Content (Join-Path $root 'src\Program.cs') -Raw
+if ($programCs -notmatch 'AssemblyInformationalVersion\("(\d+\.\d+\.\d+)"\)') { throw 'Version not found in src\Program.cs' }
+$version = $Matches[1]
+$iscc = @(
+    (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $iscc) { throw 'Inno Setup 6 not found (winget install JRSoftware.InnoSetup).' }
+$dist = Join-Path $root 'dist'
+if (Test-Path $dist) {
+    # A junction/link named dist: remove only the link, never the files it points to.
+    if ((Get-Item $dist -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { [IO.Directory]::Delete($dist) }
+    else { Remove-Item -Recurse -Force $dist }
+}
+Push-Location $root
+try { & $iscc /Q "/DAppVersion=$version" installer.iss } finally { Pop-Location }
+if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
+$setup = Join-Path $dist "VaultKeep-Setup-$version.exe"
+if (-not (Test-Path $setup)) { throw "Installer not found: $setup" }
+$hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+# LF line ending and no BOM, so `sha256sum -c SHA256SUMS.txt` works too.
+[IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'), "$hash  $(Split-Path $setup -Leaf)`n")
+Write-Host "Built $setup"
+Write-Host "SHA-256 $hash"
